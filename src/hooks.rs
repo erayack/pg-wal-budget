@@ -1,0 +1,344 @@
+#![allow(clippy::redundant_pub_crate)]
+
+use std::cell::RefCell;
+
+use pgrx::pg_sys;
+use pgrx::{PgLogLevel, PgSqlErrorCode, ereport};
+
+use crate::admission::{self, AdmissionError};
+use crate::errors::PwbError;
+use crate::guc;
+use crate::predict;
+use crate::reconcile;
+use crate::scope;
+use crate::types::{
+    ActiveStatementOrigin, ActiveStatementState, AdmissionContext, QueryId, StatementClass,
+};
+use crate::utility;
+
+static mut PREV_EXECUTOR_START_HOOK: pg_sys::ExecutorStart_hook_type = None;
+static mut PREV_EXECUTOR_END_HOOK: pg_sys::ExecutorEnd_hook_type = None;
+static mut PREV_PROCESS_UTILITY_HOOK: pg_sys::ProcessUtility_hook_type = None;
+
+thread_local! {
+    static ACTIVE_STATEMENTS: RefCell<Vec<ActiveStatementState>> = const { RefCell::new(Vec::new()) };
+    static ADMISSION_BYPASS_DEPTH: RefCell<usize> = const { RefCell::new(0) };
+}
+
+struct AdmissionBypassGuard;
+
+pub(crate) fn install_hooks() {
+    // SAFETY: _PG_init runs while PostgreSQL is loading the extension. Hook installation follows
+    // PostgreSQL's extension convention: save the existing hook, then publish this extension's hook.
+    unsafe {
+        PREV_EXECUTOR_START_HOOK = pg_sys::ExecutorStart_hook;
+        pg_sys::ExecutorStart_hook = Some(executor_start_hook);
+
+        PREV_EXECUTOR_END_HOOK = pg_sys::ExecutorEnd_hook;
+        pg_sys::ExecutorEnd_hook = Some(executor_end_hook);
+
+        PREV_PROCESS_UTILITY_HOOK = pg_sys::ProcessUtility_hook;
+        pg_sys::ProcessUtility_hook = Some(process_utility_hook);
+
+        pg_sys::RegisterXactCallback(Some(xact_callback), core::ptr::null_mut());
+    }
+}
+
+unsafe extern "C-unwind" fn executor_start_hook(
+    query_desc: *mut pg_sys::QueryDesc,
+    eflags: core::ffi::c_int,
+) {
+    if guc::enabled() && !admission_is_bypassed() {
+        match admit_normal_statement(query_desc) {
+            Ok(Some(active_statement)) => {
+                push_active_statement(reconcile::capture_start(active_statement));
+            }
+            Ok(None) => {}
+            Err(AdmissionError::Rejected {
+                policy_id,
+                predicted_wal_bytes,
+                available_wal_bytes,
+            }) => {
+                raise_pwb_error(PwbError::BudgetExceeded {
+                    policy_id,
+                    predicted_wal_bytes,
+                    available_wal_bytes,
+                });
+            }
+            Err(AdmissionError::Internal(error)) => handle_internal_admission_error(error),
+        }
+    }
+
+    // SAFETY: PostgreSQL invokes this hook with the same arguments expected by either the previous
+    // hook or standard_ExecutorStart. This no-op hook only preserves hook chaining semantics.
+    unsafe {
+        if let Some(prev_hook) = PREV_EXECUTOR_START_HOOK {
+            prev_hook(query_desc, eflags);
+        } else {
+            pg_sys::standard_ExecutorStart(query_desc, eflags);
+        }
+    }
+}
+
+unsafe extern "C-unwind" fn executor_end_hook(query_desc: *mut pg_sys::QueryDesc) {
+    // SAFETY: PostgreSQL invokes this hook with the same argument expected by either the previous
+    // hook or standard_ExecutorEnd. This no-op hook only preserves hook chaining semantics.
+    unsafe {
+        if let Some(prev_hook) = PREV_EXECUTOR_END_HOOK {
+            prev_hook(query_desc);
+        } else {
+            pg_sys::standard_ExecutorEnd(query_desc);
+        }
+    }
+
+    if let Some(active_statement) = pop_active_statement(ActiveStatementOrigin::Executor) {
+        reconcile::reconcile_completed_statement(&active_statement);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C-unwind" fn process_utility_hook(
+    pstmt: *mut pg_sys::PlannedStmt,
+    query_string: *const core::ffi::c_char,
+    read_only_tree: bool,
+    context: pg_sys::ProcessUtilityContext::Type,
+    params: pg_sys::ParamListInfo,
+    query_env: *mut pg_sys::QueryEnvironment,
+    dest: *mut pg_sys::DestReceiver,
+    qc: *mut pg_sys::QueryCompletion,
+) {
+    let utility_admitted = if guc::enabled() && !admission_is_bypassed() {
+        match admit_utility_statement(pstmt, read_only_tree) {
+            Ok(Some(active_statement)) => {
+                push_active_statement(reconcile::capture_start(active_statement));
+                true
+            }
+            Ok(None) => false,
+            Err(AdmissionError::Rejected {
+                policy_id,
+                predicted_wal_bytes,
+                available_wal_bytes,
+            }) => {
+                raise_pwb_error(PwbError::BudgetExceeded {
+                    policy_id,
+                    predicted_wal_bytes,
+                    available_wal_bytes,
+                });
+            }
+            Err(AdmissionError::Internal(error)) => {
+                handle_internal_admission_error(error);
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    // SAFETY: PostgreSQL invokes this hook with the same arguments expected by either the previous
+    // hook or standard_ProcessUtility. Admission has completed, so the internal bypass guard is no
+    // longer active while the user utility statement runs.
+    unsafe {
+        if let Some(prev_hook) = PREV_PROCESS_UTILITY_HOOK {
+            prev_hook(
+                pstmt,
+                query_string,
+                read_only_tree,
+                context,
+                params,
+                query_env,
+                dest,
+                qc,
+            );
+        } else {
+            pg_sys::standard_ProcessUtility(
+                pstmt,
+                query_string,
+                read_only_tree,
+                context,
+                params,
+                query_env,
+                dest,
+                qc,
+            );
+        }
+    }
+
+    if utility_admitted
+        && let Some(active_statement) = pop_active_statement(ActiveStatementOrigin::Utility)
+    {
+        reconcile::reconcile_completed_statement(&active_statement);
+    }
+}
+
+unsafe extern "C-unwind" fn xact_callback(
+    event: pg_sys::XactEvent::Type,
+    _arg: *mut core::ffi::c_void,
+) {
+    match event {
+        pg_sys::XactEvent::XACT_EVENT_COMMIT
+        | pg_sys::XactEvent::XACT_EVENT_PARALLEL_COMMIT
+        | pg_sys::XactEvent::XACT_EVENT_ABORT
+        | pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT => {
+            for active_statement in drain_active_statements() {
+                if matches!(
+                    event,
+                    pg_sys::XactEvent::XACT_EVENT_ABORT
+                        | pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT
+                ) {
+                    let _ = reconcile::record_aborted_statement(&active_statement);
+                } else {
+                    admission::record_missing_actual_wal();
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn admit_utility_statement(
+    pstmt: *mut pg_sys::PlannedStmt,
+    read_only_tree: bool,
+) -> Result<Option<ActiveStatementState>, AdmissionError> {
+    let _guard = AdmissionBypassGuard::enter();
+    utility::admit_utility_statement(pstmt, read_only_tree)
+        .map(|admission| admission.map(|admission| admission.active_statement))
+}
+
+fn admit_normal_statement(
+    query_desc: *mut pg_sys::QueryDesc,
+) -> Result<Option<ActiveStatementState>, AdmissionError> {
+    let _guard = AdmissionBypassGuard::enter();
+    // SAFETY: `query_desc` is the pointer PostgreSQL passed to ExecutorStart for this backend.
+    let statement_class = unsafe { classify_planned_statement(query_desc) }?;
+    // SAFETY: `query_desc` is the pointer PostgreSQL passed to ExecutorStart for this backend.
+    let query_id = unsafe { extract_query_id(query_desc) };
+    let scope = scope::classify_current_scope().map_err(AdmissionError::Internal)?;
+    let predicted_wal_bytes =
+        predict::predict_wal_bytes(statement_class, query_id, scope.value_hash);
+    let context = AdmissionContext {
+        query_id,
+        scope,
+        statement_class,
+        predicted_wal_bytes,
+    };
+    admission::admit_context(&context, ActiveStatementOrigin::Executor).map(Some)
+}
+
+unsafe fn classify_planned_statement(
+    query_desc: *mut pg_sys::QueryDesc,
+) -> Result<StatementClass, AdmissionError> {
+    if query_desc.is_null() {
+        return Err(AdmissionError::Internal(PwbError::Internal {
+            message: "executor start received a null QueryDesc".to_string(),
+        }));
+    }
+
+    // SAFETY: The caller passes PostgreSQL's QueryDesc pointer for the current executor hook.
+    let planned_statement = unsafe { (*query_desc).plannedstmt };
+    if planned_statement.is_null() {
+        return Err(AdmissionError::Internal(PwbError::Internal {
+            message: "executor start received a QueryDesc without a PlannedStmt".to_string(),
+        }));
+    }
+
+    // SAFETY: The planned statement pointer was read from a live QueryDesc.
+    let planned_statement = unsafe { &*planned_statement };
+    match planned_statement.commandType {
+        pg_sys::CmdType::CMD_SELECT if planned_statement.hasModifyingCTE => {
+            Ok(StatementClass::Write)
+        }
+        pg_sys::CmdType::CMD_SELECT => Ok(StatementClass::ReadOnly),
+        pg_sys::CmdType::CMD_INSERT
+        | pg_sys::CmdType::CMD_UPDATE
+        | pg_sys::CmdType::CMD_DELETE
+        | pg_sys::CmdType::CMD_MERGE => Ok(StatementClass::Write),
+        _ => Ok(StatementClass::Unknown),
+    }
+}
+
+unsafe fn extract_query_id(query_desc: *mut pg_sys::QueryDesc) -> Option<QueryId> {
+    if query_desc.is_null() {
+        return None;
+    }
+
+    // SAFETY: The caller passes PostgreSQL's QueryDesc pointer for the current executor hook.
+    let planned_statement = unsafe { (*query_desc).plannedstmt };
+    if planned_statement.is_null() {
+        return None;
+    }
+
+    // SAFETY: The planned statement pointer was read from a live QueryDesc.
+    let query_id = unsafe { (*planned_statement).queryId };
+    if query_id == 0 {
+        None
+    } else {
+        Some(query_id as QueryId)
+    }
+}
+
+fn handle_internal_admission_error(error: PwbError) {
+    if guc::fail_open() {
+        admission::record_internal_fail_open();
+        return;
+    }
+
+    raise_pwb_error(error);
+}
+
+fn push_active_statement(statement: ActiveStatementState) {
+    ACTIVE_STATEMENTS.with(|statements| {
+        statements.borrow_mut().push(statement);
+    });
+}
+
+pub(crate) fn pop_active_statement(origin: ActiveStatementOrigin) -> Option<ActiveStatementState> {
+    ACTIVE_STATEMENTS.with(|statements| {
+        let mut statements = statements.borrow_mut();
+        let index = statements
+            .iter()
+            .rposition(|statement| statement.origin == origin)?;
+        Some(statements.remove(index))
+    })
+}
+
+fn drain_active_statements() -> Vec<ActiveStatementState> {
+    ACTIVE_STATEMENTS.with(|statements| statements.borrow_mut().drain(..).collect())
+}
+
+fn admission_is_bypassed() -> bool {
+    ADMISSION_BYPASS_DEPTH.with(|depth| *depth.borrow() > 0)
+}
+
+impl AdmissionBypassGuard {
+    fn enter() -> Self {
+        ADMISSION_BYPASS_DEPTH.with(|depth| {
+            let mut depth = depth.borrow_mut();
+            *depth = depth.saturating_add(1);
+        });
+        Self
+    }
+}
+
+impl Drop for AdmissionBypassGuard {
+    fn drop(&mut self) {
+        ADMISSION_BYPASS_DEPTH.with(|depth| {
+            let mut depth = depth.borrow_mut();
+            *depth = depth.saturating_sub(1);
+        });
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn raise_pwb_error(error: PwbError) -> ! {
+    let sqlstate = match error.sqlstate() {
+        "22023" => PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+        "42501" => PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
+        "XX000" => PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+        _ => PgSqlErrorCode::ERRCODE_RAISE_EXCEPTION,
+    };
+    let message = error.message();
+    let detail = error.to_string();
+
+    ereport!(PgLogLevel::ERROR, sqlstate, format!("{message}: {detail}"));
+    unreachable!("ereport(ERROR) should not return");
+}
