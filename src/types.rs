@@ -222,8 +222,7 @@ pub(crate) enum ActiveStatementOrigin {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WalMeasurementKind {
-    /// Exact per-backend WAL accounting. No current Postgres 17 fallback path sets this; it is
-    /// reserved so enforcement reconciliation can be wired without changing admission state again.
+    /// Exact per-backend WAL accounting from PostgreSQL's backend-local WAL usage accumulator.
     ExactBackend,
     ApproximateInsertLsn,
     Unavailable,

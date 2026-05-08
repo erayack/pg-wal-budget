@@ -9,8 +9,18 @@ use crate::profile;
 use crate::shmem::{self, CounterDelta, RecentDecisionRecord};
 use crate::types::{ActiveStatementState, DecisionKind, WalBytes, WalMeasurementKind};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetReconciliation {
+    None,
+    Refund(WalBytes),
+    Debt(WalBytes),
+}
+
 pub(crate) fn capture_start(mut statement: ActiveStatementState) -> ActiveStatementState {
-    if let Some(lsn) = current_wal_insert_lsn() {
+    if let Some(wal_bytes) = current_backend_wal_bytes() {
+        statement.start_wal_bytes = Some(wal_bytes);
+        statement.measurement_kind = WalMeasurementKind::ExactBackend;
+    } else if let Some(lsn) = current_wal_insert_lsn() {
         statement.start_wal_bytes = Some(lsn);
         statement.measurement_kind = WalMeasurementKind::ApproximateInsertLsn;
     } else {
@@ -26,7 +36,7 @@ pub(crate) fn reconcile_completed_statement(statement: &ActiveStatementState) {
         admission::record_missing_actual_wal();
         return;
     };
-    let Some(end_wal_bytes) = current_wal_insert_lsn() else {
+    let Some(end_wal_bytes) = current_measurement_for_kind(statement.measurement_kind) else {
         admission::record_missing_actual_wal();
         return;
     };
@@ -60,18 +70,16 @@ pub(crate) fn reconcile_completed_statement(statement: &ActiveStatementState) {
         reason_code: statement.decision.reason_code,
     }));
 
-    if matches!(statement.measurement_kind, WalMeasurementKind::ExactBackend)
-        && let Some(query_id) = statement.query_id
-    {
+    if should_record_profile_observation(statement) {
         record_reconciliation_result(&profile::record_observation(
             statement.scope_hash,
-            Some(query_id),
+            statement.query_id,
             actual_wal_bytes,
             now_epoch_ms,
         ));
     }
 
-    record_reconciliation_result(&reconcile_budget(statement, actual_wal_bytes, debt_bytes));
+    record_reconciliation_result(&reconcile_budget(statement, actual_wal_bytes));
 }
 
 pub(crate) fn record_aborted_statement(statement: &ActiveStatementState) -> PwbResult<()> {
@@ -85,11 +93,7 @@ pub(crate) fn record_aborted_statement(statement: &ActiveStatementState) -> PwbR
     Ok(())
 }
 
-fn reconcile_budget(
-    statement: &ActiveStatementState,
-    actual_wal_bytes: WalBytes,
-    debt_bytes: WalBytes,
-) -> PwbResult<()> {
+fn reconcile_budget(statement: &ActiveStatementState, actual_wal_bytes: WalBytes) -> PwbResult<()> {
     if !should_reconcile_budget(statement) {
         return Ok(());
     }
@@ -98,22 +102,26 @@ fn reconcile_budget(
         return Ok(());
     };
 
-    if actual_wal_bytes < statement.decision.charged_bytes {
-        budget::refund_charged_bytes(
-            policy_id,
-            statement.scope_hash,
-            statement.decision.charged_bytes - actual_wal_bytes,
-        )?;
-    } else if debt_bytes > 0 {
-        budget::record_underprediction_debt(policy_id, statement.scope_hash, debt_bytes)?;
+    match budget_reconciliation(statement, actual_wal_bytes) {
+        BudgetReconciliation::None => {}
+        BudgetReconciliation::Refund(refund_bytes) => {
+            budget::refund_charged_bytes(policy_id, statement.scope_hash, refund_bytes)?;
+        }
+        BudgetReconciliation::Debt(debt_bytes) => {
+            budget::record_underprediction_debt(policy_id, statement.scope_hash, debt_bytes)?;
+        }
     }
 
     Ok(())
 }
 
+const fn should_record_profile_observation(statement: &ActiveStatementState) -> bool {
+    matches!(statement.measurement_kind, WalMeasurementKind::ExactBackend)
+        && statement.query_id.is_some()
+}
+
 const fn should_reconcile_budget(statement: &ActiveStatementState) -> bool {
-    // `ExactBackend` is reserved for a future per-backend WAL counter. The pg17 insert-LSN
-    // fallback is cluster-wide and must never adjust enforcement buckets.
+    // The insert-LSN fallback is cluster-wide and must never adjust enforcement buckets.
     matches!(statement.decision.kind, DecisionKind::Allowed)
         && statement.decision.charged_bytes > 0
         && matches!(statement.measurement_kind, WalMeasurementKind::ExactBackend)
@@ -138,6 +146,23 @@ const fn exact_reconciliation_debt_bytes(
     }
 }
 
+const fn budget_reconciliation(
+    statement: &ActiveStatementState,
+    actual_wal_bytes: WalBytes,
+) -> BudgetReconciliation {
+    if !should_reconcile_budget(statement) {
+        return BudgetReconciliation::None;
+    }
+
+    if actual_wal_bytes < statement.decision.charged_bytes {
+        BudgetReconciliation::Refund(statement.decision.charged_bytes - actual_wal_bytes)
+    } else if actual_wal_bytes > statement.decision.charged_bytes {
+        BudgetReconciliation::Debt(actual_wal_bytes - statement.decision.charged_bytes)
+    } else {
+        BudgetReconciliation::None
+    }
+}
+
 fn current_wal_insert_lsn() -> Option<WalBytes> {
     // SAFETY: These PostgreSQL WAL accessors are read-only and are called from a live backend
     // during hook execution. XLogInsertAllowed guards contexts where insert WAL state is not usable.
@@ -148,6 +173,28 @@ fn current_wal_insert_lsn() -> Option<WalBytes> {
 
         Some(pg_sys::GetXLogInsertRecPtr() as WalBytes)
     }
+}
+
+fn current_measurement_for_kind(kind: WalMeasurementKind) -> Option<WalBytes> {
+    match kind {
+        WalMeasurementKind::ExactBackend => current_backend_wal_bytes(),
+        WalMeasurementKind::ApproximateInsertLsn => current_wal_insert_lsn(),
+        WalMeasurementKind::Unavailable => None,
+    }
+}
+
+#[cfg(feature = "pg17")]
+fn current_backend_wal_bytes() -> Option<WalBytes> {
+    // SAFETY: `pgWalUsage` is PostgreSQL's backend-local WAL usage accumulator for the current
+    // process. Reading its `wal_bytes` field is a non-mutating snapshot taken inside a live
+    // backend hook. It is exact for this backend and does not include concurrent backends.
+    Some(unsafe { pg_sys::pgWalUsage.wal_bytes as WalBytes })
+}
+
+#[cfg(not(feature = "pg17"))]
+const fn current_backend_wal_bytes() -> Option<WalBytes> {
+    // Keep the optional return type so unsupported targets can fall back to insert-LSN telemetry.
+    None
 }
 
 fn record_reconciliation_result(result: &PwbResult<()>) {
@@ -196,6 +243,58 @@ mod tests {
         statement.decision = AdmissionDecision::allowed(Some(7), 100, ReasonCode::BudgetAvailable);
         statement.measurement_kind = WalMeasurementKind::ApproximateInsertLsn;
         assert!(!should_reconcile_budget(&statement));
+    }
+
+    #[test]
+    fn profile_observations_require_exact_measurement_and_query_id() {
+        let mut statement = test_statement(AdmissionDecision::allowed(
+            Some(7),
+            100,
+            ReasonCode::BudgetAvailable,
+        ));
+        assert!(should_record_profile_observation(&statement));
+
+        statement.measurement_kind = WalMeasurementKind::ApproximateInsertLsn;
+        assert!(!should_record_profile_observation(&statement));
+
+        statement.measurement_kind = WalMeasurementKind::ExactBackend;
+        statement.query_id = None;
+        assert!(!should_record_profile_observation(&statement));
+    }
+
+    #[test]
+    fn budget_reconciliation_refunds_or_records_debt_only_for_exact_charges() {
+        let mut statement = test_statement(AdmissionDecision::allowed(
+            Some(7),
+            100,
+            ReasonCode::BudgetAvailable,
+        ));
+
+        assert_eq!(
+            budget_reconciliation(&statement, 60),
+            BudgetReconciliation::Refund(40)
+        );
+        assert_eq!(
+            budget_reconciliation(&statement, 140),
+            BudgetReconciliation::Debt(40)
+        );
+        assert_eq!(
+            budget_reconciliation(&statement, 100),
+            BudgetReconciliation::None
+        );
+
+        statement.measurement_kind = WalMeasurementKind::ApproximateInsertLsn;
+        assert_eq!(
+            budget_reconciliation(&statement, 140),
+            BudgetReconciliation::None
+        );
+
+        statement.measurement_kind = WalMeasurementKind::ExactBackend;
+        statement.decision = AdmissionDecision::allowed(Some(7), 0, ReasonCode::ObserveMode);
+        assert_eq!(
+            budget_reconciliation(&statement, 140),
+            BudgetReconciliation::None
+        );
     }
 
     fn test_statement(decision: AdmissionDecision) -> ActiveStatementState {
