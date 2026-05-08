@@ -44,6 +44,7 @@ pub(crate) fn install_hooks() {
     }
 }
 
+#[pgrx::pg_guard]
 unsafe extern "C-unwind" fn executor_start_hook(
     query_desc: *mut pg_sys::QueryDesc,
     eflags: core::ffi::c_int,
@@ -80,6 +81,7 @@ unsafe extern "C-unwind" fn executor_start_hook(
     }
 }
 
+#[pgrx::pg_guard]
 unsafe extern "C-unwind" fn executor_end_hook(query_desc: *mut pg_sys::QueryDesc) {
     // SAFETY: PostgreSQL invokes this hook with the same argument expected by either the previous
     // hook or standard_ExecutorEnd. This no-op hook only preserves hook chaining semantics.
@@ -97,6 +99,7 @@ unsafe extern "C-unwind" fn executor_end_hook(query_desc: *mut pg_sys::QueryDesc
 }
 
 #[allow(clippy::too_many_arguments)]
+#[pgrx::pg_guard]
 unsafe extern "C-unwind" fn process_utility_hook(
     pstmt: *mut pg_sys::PlannedStmt,
     query_string: *const core::ffi::c_char,
@@ -177,6 +180,7 @@ unsafe extern "C-unwind" fn process_utility_hook(
     }
 }
 
+#[pgrx::pg_guard]
 unsafe extern "C-unwind" fn xact_callback(
     event: pg_sys::XactEvent::Type,
     _arg: *mut core::ffi::c_void,
