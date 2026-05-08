@@ -1,4 +1,3 @@
-\echo Use "CREATE EXTENSION pg_wal_budget" to load this file. \quit
 
 create table pwb.policy (
   policy_id integer generated always as identity primary key,

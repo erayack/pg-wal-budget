@@ -108,26 +108,33 @@ unsafe extern "C-unwind" fn process_utility_hook(
     qc: *mut pg_sys::QueryCompletion,
 ) {
     let utility_admitted = if guc::enabled() && !admission_is_bypassed() {
-        match admit_utility_statement(pstmt, read_only_tree) {
-            Ok(Some(active_statement)) => {
-                push_active_statement(reconcile::capture_start(active_statement));
-                true
-            }
-            Ok(None) => false,
-            Err(AdmissionError::Rejected {
-                policy_id,
-                predicted_wal_bytes,
-                available_wal_bytes,
-            }) => {
-                raise_pwb_error(PwbError::BudgetExceeded {
+        // SAFETY: `pstmt` is the PlannedStmt pointer PostgreSQL passed to ProcessUtility for this
+        // invocation; the helper validates node tags before reading extension-specific fields.
+        let bypass_extension_install = unsafe { utility::is_pg_wal_budget_create_extension(pstmt) };
+        if bypass_extension_install {
+            false
+        } else {
+            match admit_utility_statement(pstmt, read_only_tree) {
+                Ok(Some(active_statement)) => {
+                    push_active_statement(reconcile::capture_start(active_statement));
+                    true
+                }
+                Ok(None) => false,
+                Err(AdmissionError::Rejected {
                     policy_id,
                     predicted_wal_bytes,
                     available_wal_bytes,
-                });
-            }
-            Err(AdmissionError::Internal(error)) => {
-                handle_internal_admission_error(error);
-                false
+                }) => {
+                    raise_pwb_error(PwbError::BudgetExceeded {
+                        policy_id,
+                        predicted_wal_bytes,
+                        available_wal_bytes,
+                    });
+                }
+                Err(AdmissionError::Internal(error)) => {
+                    handle_internal_admission_error(error);
+                    false
+                }
             }
         }
     } else {
@@ -222,6 +229,11 @@ fn admit_normal_statement(
         predicted_wal_bytes,
     };
     admission::admit_context(&context, ActiveStatementOrigin::Executor).map(Some)
+}
+
+pub(crate) fn with_admission_bypass<R>(callback: impl FnOnce() -> R) -> R {
+    let _guard = AdmissionBypassGuard::enter();
+    callback()
 }
 
 unsafe fn classify_planned_statement(

@@ -11,6 +11,7 @@ use pgrx::{PgLogLevel, PgSqlErrorCode, Spi, ereport};
 
 use crate::budget::EffectivePolicy;
 use crate::errors::{PwbError, PwbResult};
+use crate::hooks;
 use crate::types::{BudgetMode, EpochMillis, PolicyId, ScopeKey, ScopeKind, WalBytes};
 
 const POLICY_CACHE_REFRESH_INTERVAL_MS: EpochMillis = 1000;
@@ -123,6 +124,13 @@ pub(crate) fn invalidate_backend_policy_cache() {
 }
 
 fn load_policy_cache(now_epoch_ms: EpochMillis) -> PwbResult<PolicyCache> {
+    if !policy_table_exists()? {
+        return Ok(PolicyCache {
+            refreshed_epoch_ms: now_epoch_ms,
+            policies: Vec::new(),
+        });
+    }
+
     let raw_policy = Spi::connect(|client| {
         let table = client.select(
             "
@@ -167,6 +175,12 @@ fn load_policy_cache(now_epoch_ms: EpochMillis) -> PwbResult<PolicyCache> {
         refreshed_epoch_ms: now_epoch_ms,
         policies,
     })
+}
+
+fn policy_table_exists() -> PwbResult<bool> {
+    Spi::get_one::<bool>("select to_regclass('pwb.policy') is not null")
+        .map(|exists| exists.unwrap_or(false))
+        .map_err(spi_error)
 }
 
 fn decode_cached_policy(raw_policy: RawEffectivePolicy) -> PwbResult<CachedEffectivePolicy> {
@@ -237,7 +251,7 @@ const fn cache_is_stale(cache: &PolicyCache, now_epoch_ms: EpochMillis) -> bool 
 #[pg_extern]
 fn pwb_create_policy(
     scope_kind: &str,
-    scope_value: default!(Option<&str>, "NULL"),
+    scope_value: Option<&str>,
     wal_rate_bytes_per_sec: i64,
     wal_burst_bytes: i64,
     mode: default!(&str, "'observe'"),
@@ -286,8 +300,9 @@ fn create_policy_impl(
     let mode = policy.mode.as_sql_str();
     let scope_kind = policy.scope_kind.as_sql_str();
 
-    let policy_id = Spi::get_one_with_args::<i32>(
-        "
+    let policy_id = hooks::with_admission_bypass(|| {
+        Spi::get_one_with_args::<i32>(
+            "
         insert into pwb.policy (
           enabled,
           mode,
@@ -300,16 +315,17 @@ fn create_policy_impl(
         values ($1, $2, $3, $4, $5, $6, $7)
         returning policy_id
         ",
-        &[
-            policy.enabled.into(),
-            mode.into(),
-            scope_kind.into(),
-            nullable_text_arg(policy.scope_value.as_deref()),
-            rate.into(),
-            burst.into(),
-            policy.priority.into(),
-        ],
-    )
+            &[
+                policy.enabled.into(),
+                mode.into(),
+                scope_kind.into(),
+                nullable_text_arg(policy.scope_value.as_deref()),
+                rate.into(),
+                burst.into(),
+                policy.priority.into(),
+            ],
+        )
+    })
     .map_err(spi_error)?;
 
     let policy_id = policy_id.ok_or_else(|| PwbError::Internal {
@@ -321,15 +337,21 @@ fn create_policy_impl(
 
 fn set_policy_mode_impl(policy_id: PolicyId, mode: &str) -> PwbResult<()> {
     let mode = validate_policy_mode(mode)?;
-    let updated = Spi::get_one_with_args::<bool>(
-        "
+
+    let updated = hooks::with_admission_bypass(|| {
+        Spi::get_one_with_args::<bool>(
+            "
+        with updated as (
         update pwb.policy
            set mode = $2
          where policy_id = $1
         returning true
+        )
+        select exists (select 1 from updated)
         ",
-        &[policy_id.into(), mode.as_sql_str().into()],
-    )
+            &[policy_id.into(), mode.as_sql_str().into()],
+        )
+    })
     .map_err(spi_error)?;
 
     require_policy_updated(policy_id, updated)?;
@@ -338,15 +360,20 @@ fn set_policy_mode_impl(policy_id: PolicyId, mode: &str) -> PwbResult<()> {
 }
 
 fn disable_policy_impl(policy_id: PolicyId) -> PwbResult<()> {
-    let updated = Spi::get_one_with_args::<bool>(
-        "
+    let updated = hooks::with_admission_bypass(|| {
+        Spi::get_one_with_args::<bool>(
+            "
+        with updated as (
         update pwb.policy
            set enabled = false
          where policy_id = $1
         returning true
+        )
+        select exists (select 1 from updated)
         ",
-        &[policy_id.into()],
-    )
+            &[policy_id.into()],
+        )
+    })
     .map_err(spi_error)?;
 
     require_policy_updated(policy_id, updated)?;

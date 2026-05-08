@@ -41,6 +41,40 @@ pub(crate) fn admit_utility_statement(
         .map(|active_statement| Some(UtilityAdmission { active_statement }))
 }
 
+#[allow(clippy::cast_ptr_alignment)]
+pub(crate) unsafe fn is_pg_wal_budget_create_extension(pstmt: *mut pg_sys::PlannedStmt) -> bool {
+    // SAFETY: `pstmt` is the PlannedStmt pointer PostgreSQL passed to ProcessUtility.
+    let Ok(planned_statement) = (unsafe { planned_statement_ref(pstmt) }) else {
+        return false;
+    };
+    if planned_statement.commandType != pg_sys::CmdType::CMD_UTILITY
+        || planned_statement.utilityStmt.is_null()
+    {
+        return false;
+    }
+
+    // SAFETY: utilityStmt is non-null and Node-compatible for utility planned statements.
+    let node = unsafe { &*planned_statement.utilityStmt.cast::<pg_sys::Node>() };
+    if node.type_ != pg_sys::NodeTag::T_CreateExtensionStmt {
+        return false;
+    }
+
+    // SAFETY: The node tag confirms this is a CreateExtensionStmt. PostgreSQL allocates parse
+    // nodes with alignment suitable for their concrete struct type.
+    let create_extension = unsafe {
+        &*planned_statement
+            .utilityStmt
+            .cast::<pg_sys::CreateExtensionStmt>()
+    };
+    if create_extension.extname.is_null() {
+        return false;
+    }
+
+    // SAFETY: PostgreSQL stores extension names as null-terminated C strings in the parse node.
+    let extension_name = unsafe { CStr::from_ptr(create_extension.extname) };
+    extension_name.to_bytes() == b"pg_wal_budget"
+}
+
 unsafe fn classify_utility_statement(
     pstmt: *mut pg_sys::PlannedStmt,
     read_only_tree: bool,

@@ -22,6 +22,7 @@ const UNSET_ENUM: u8 = 0;
 
 static mut SHARED_STATE: *mut PwbSharedState = ptr::null_mut();
 static mut SHARED_LOCK: *mut pg_sys::LWLock = ptr::null_mut();
+static mut PREV_SHMEM_REQUEST_HOOK: pg_sys::shmem_request_hook_type = None;
 static mut PREV_SHMEM_STARTUP_HOOK: pg_sys::shmem_startup_hook_type = None;
 static mut REQUESTED_LAYOUT: SharedLayout = SharedLayout::empty();
 
@@ -174,6 +175,24 @@ pub(crate) struct BudgetBucketState {
     pub(crate) debt_bytes: WalBytes,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueryProfileSnapshot {
+    pub(crate) scope_hash: Option<ScopeHash>,
+    pub(crate) query_id: QueryId,
+    pub(crate) profile: QueryWalProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BudgetBucketSnapshot {
+    pub(crate) policy_id: PolicyId,
+    pub(crate) scope_hash: ScopeHash,
+    pub(crate) available_bytes: WalBytes,
+    pub(crate) max_burst_bytes: WalBytes,
+    pub(crate) rate_bytes_per_sec: WalBytes,
+    pub(crate) last_refill_epoch_ms: EpochMillis,
+    pub(crate) debt_bytes: WalBytes,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CounterDelta {
     pub(crate) accepted_statements: u64,
@@ -251,6 +270,25 @@ impl SharedLayout {
 }
 
 pub(crate) fn request_shared_memory() {
+    // SAFETY: _PG_init runs during extension preload. Shared memory sizing must happen from
+    // PostgreSQL's shmem_request_hook; startup initialization remains in shmem_startup_hook.
+    unsafe {
+        PREV_SHMEM_REQUEST_HOOK = pg_sys::shmem_request_hook;
+        pg_sys::shmem_request_hook = Some(shmem_request);
+        PREV_SHMEM_STARTUP_HOOK = pg_sys::shmem_startup_hook;
+        pg_sys::shmem_startup_hook = Some(shmem_startup);
+    }
+}
+
+unsafe extern "C-unwind" fn shmem_request() {
+    // SAFETY: PostgreSQL invokes this hook while addin shared memory requests are still allowed.
+    // Chaining the previous hook preserves any hook installed before this extension.
+    unsafe {
+        if let Some(prev_hook) = PREV_SHMEM_REQUEST_HOOK {
+            prev_hook();
+        }
+    }
+
     let layout = match compute_layout(
         guc::recent_decision_capacity(),
         guc::profile_cache_capacity(),
@@ -261,14 +299,11 @@ pub(crate) fn request_shared_memory() {
 
     let size = layout.total_bytes;
 
-    // SAFETY: _PG_init runs during extension preload. PostgreSQL requires addin shared memory and
-    // named LWLock requests to happen before shared memory is finalized.
+    // SAFETY: PostgreSQL invokes shmem_request_hook before shared memory is finalized.
     unsafe {
         REQUESTED_LAYOUT = layout;
         pg_sys::RequestAddinShmemSpace(size);
         pg_sys::RequestNamedLWLockTranche(LWLOCK_TRANCHE_NAME.as_ptr().cast(), 1);
-        PREV_SHMEM_STARTUP_HOOK = pg_sys::shmem_startup_hook;
-        pg_sys::shmem_startup_hook = Some(shmem_startup);
     }
 }
 
@@ -298,6 +333,16 @@ pub(crate) fn snapshot_counters() -> PwbResult<PwbCounters> {
 pub(crate) fn reset_counters() -> PwbResult<()> {
     with_locked_state(|state, _recent_decisions, _profiles| {
         state.counters = PwbCounters::default();
+        Ok(())
+    })
+}
+
+pub(crate) fn reset_stats() -> PwbResult<()> {
+    with_locked_state(|state, recent_decisions, _profiles| {
+        state.counters = PwbCounters::default();
+        state.recent_decision_head = 0;
+        state.recent_decision_count = 0;
+        recent_decisions.fill(PwbRecentDecision::default());
         Ok(())
     })
 }
@@ -380,6 +425,10 @@ pub(crate) fn reset_profiles() -> PwbResult<()> {
         profiles.fill(PwbProfileEntry::default());
         Ok(())
     })
+}
+
+pub(crate) fn snapshot_query_profiles() -> PwbResult<Vec<QueryProfileSnapshot>> {
+    with_locked_state(|_state, _recent_decisions, profiles| snapshot_profiles_from_slice(profiles))
 }
 
 pub(crate) fn lookup_query_profile(
@@ -519,6 +568,10 @@ fn upsert_query_profile_locked(
 
     profiles[slot] = PwbProfileEntry::encode(scope_hash, query_id, profile);
     Ok(())
+}
+
+pub(crate) fn snapshot_budget_buckets() -> PwbResult<Vec<BudgetBucketSnapshot>> {
+    with_locked_bucket_state(|_state, buckets| snapshot_budget_buckets_from_slice(buckets))
 }
 
 pub(crate) fn with_budget_bucket<R>(
@@ -705,6 +758,44 @@ fn apply_budget_bucket<R>(
         .saturating_add(1)
         .min(state.budget_bucket_capacity);
     Ok(result)
+}
+
+fn snapshot_profiles_from_slice(
+    profiles: &[PwbProfileEntry],
+) -> PwbResult<Vec<QueryProfileSnapshot>> {
+    let mut snapshots = Vec::new();
+
+    for profile in profiles.iter().filter(|profile| profile.occupied == 1) {
+        let decoded = profile.decode()?;
+        snapshots.push(QueryProfileSnapshot {
+            scope_hash: decoded.scope_hash,
+            query_id: decoded.query_id,
+            profile: decoded.profile.into(),
+        });
+    }
+
+    Ok(snapshots)
+}
+
+fn snapshot_budget_buckets_from_slice(
+    buckets: &[PwbBudgetBucket],
+) -> PwbResult<Vec<BudgetBucketSnapshot>> {
+    let mut snapshots = Vec::new();
+
+    for bucket in buckets.iter().filter(|bucket| bucket.occupied == 1) {
+        let decoded = bucket.decode()?;
+        snapshots.push(BudgetBucketSnapshot {
+            policy_id: decoded.policy_id,
+            scope_hash: decoded.scope_hash,
+            available_bytes: decoded.available_bytes,
+            max_burst_bytes: decoded.max_burst_bytes,
+            rate_bytes_per_sec: decoded.rate_bytes_per_sec,
+            last_refill_epoch_ms: decoded.last_refill_epoch_ms,
+            debt_bytes: decoded.debt_bytes,
+        });
+    }
+
+    Ok(snapshots)
 }
 
 struct SharedLockGuard;
@@ -1235,6 +1326,30 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_only_occupied_budget_buckets() {
+        let buckets = [
+            PwbBudgetBucket::encode(BudgetBucketState {
+                policy_id: 7,
+                scope_hash: 99,
+                available_bytes: 1024,
+                max_burst_bytes: 4096,
+                rate_bytes_per_sec: 512,
+                last_refill_epoch_ms: 123,
+                debt_bytes: 64,
+            }),
+            PwbBudgetBucket::default(),
+        ];
+
+        let snapshots =
+            snapshot_budget_buckets_from_slice(&buckets).unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].policy_id, 7);
+        assert_eq!(snapshots[0].scope_hash, 99);
+        assert_eq!(snapshots[0].debt_bytes, 64);
+    }
+
+    #[test]
     fn encodes_and_decodes_scoped_and_global_profiles() {
         let scoped =
             PwbProfileEntry::encode(Some(99), 42, PwbQueryWalProfile::from(profile(100, 1)));
@@ -1261,6 +1376,23 @@ mod tests {
         assert_eq!(find_profile_slot(&profiles, Some(99), 42), Some(0));
         assert_eq!(find_profile_slot(&profiles, None, 42), Some(1));
         assert_eq!(find_profile_slot(&profiles, Some(100), 42), None);
+    }
+
+    #[test]
+    fn snapshots_only_occupied_profiles() {
+        let profiles = [
+            PwbProfileEntry::encode(Some(99), 42, PwbQueryWalProfile::from(profile(100, 1))),
+            PwbProfileEntry::default(),
+            PwbProfileEntry::encode(None, 42, PwbQueryWalProfile::from(profile(200, 2))),
+        ];
+
+        let snapshots =
+            snapshot_profiles_from_slice(&profiles).unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].scope_hash, Some(99));
+        assert_eq!(snapshots[1].scope_hash, None);
+        assert_eq!(snapshots[1].profile.ewma_wal_bytes, 200);
     }
 
     #[test]
