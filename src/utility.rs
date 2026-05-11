@@ -13,15 +13,10 @@ use crate::types::{
     ActiveStatementOrigin, ActiveStatementState, AdmissionContext, QueryId, StatementClass,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UtilityAdmission {
-    pub(crate) active_statement: ActiveStatementState,
-}
-
 pub(crate) fn admit_utility_statement(
     pstmt: *mut pg_sys::PlannedStmt,
     read_only_tree: bool,
-) -> Result<Option<UtilityAdmission>, AdmissionError> {
+) -> Result<Option<ActiveStatementState>, AdmissionError> {
     // SAFETY: `pstmt` is the PlannedStmt pointer PostgreSQL passed to ProcessUtility.
     let statement_class = unsafe { classify_utility_statement(pstmt, read_only_tree) }
         .map_err(AdmissionError::Internal)?;
@@ -37,8 +32,7 @@ pub(crate) fn admit_utility_statement(
         predicted_wal_bytes,
     };
 
-    admission::admit_context(&context, ActiveStatementOrigin::Utility)
-        .map(|active_statement| Some(UtilityAdmission { active_statement }))
+    admission::admit_context(&context, ActiveStatementOrigin::Utility).map(Some)
 }
 
 #[allow(clippy::cast_ptr_alignment)]

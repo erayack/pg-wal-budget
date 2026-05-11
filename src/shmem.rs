@@ -349,7 +349,7 @@ pub(crate) fn reset_stats() -> PwbResult<()> {
 
 pub(crate) fn record_recent_decision(record: RecentDecisionRecord) -> PwbResult<()> {
     with_locked_state(|state, recent_decisions, _profiles| {
-        let capacity = recent_decision_capacity(state)?;
+        let capacity = recent_decision_capacity(state);
         if capacity == 0 {
             return Ok(());
         }
@@ -360,7 +360,7 @@ pub(crate) fn record_recent_decision(record: RecentDecisionRecord) -> PwbResult<
             recent_decisions.fill(PwbRecentDecision::default());
         }
 
-        let slot = ring_slot(state.recent_decision_head, capacity)?;
+        let slot = ring_slot(state.recent_decision_head, capacity);
         recent_decisions[slot] = PwbRecentDecision::encode(record);
         state.recent_decision_head = state.recent_decision_head.saturating_add(1);
         state.recent_decision_count = state
@@ -373,28 +373,26 @@ pub(crate) fn record_recent_decision(record: RecentDecisionRecord) -> PwbResult<
 
 pub(crate) fn snapshot_recent_decisions(limit: usize) -> PwbResult<Vec<RecentDecisionRecord>> {
     with_locked_state(|state, recent_decisions, _profiles| {
-        let capacity = recent_decision_capacity(state)?;
+        let capacity = recent_decision_capacity(state);
         if capacity == 0 || limit == 0 {
             return Ok(Vec::new());
         }
 
-        let count = recent_decision_count(state)?;
+        let count = recent_decision_count(state);
         let snapshot_count = limit.min(count).min(capacity);
         let mut records = Vec::with_capacity(snapshot_count);
-
-        for offset in 0..snapshot_count {
-            let sequence = state
+        let mut sequence =
+            state
                 .recent_decision_head
-                .checked_sub(
-                    1 + u64::try_from(offset).map_err(|_| PwbError::Internal {
-                        message: "recent decision offset does not fit u64".to_string(),
-                    })?,
-                )
+                .checked_sub(1)
                 .ok_or_else(|| PwbError::Internal {
                     message: "recent decision ring head underflow".to_string(),
                 })?;
-            let slot = ring_slot(sequence, capacity)?;
+
+        for _ in 0..snapshot_count {
+            let slot = ring_slot(sequence, capacity);
             records.push(recent_decisions[slot].decode()?);
+            sequence = sequence.saturating_sub(1);
         }
 
         Ok(records)
@@ -724,7 +722,7 @@ fn apply_budget_bucket<R>(
     initializer: impl FnOnce() -> BudgetBucketState,
     callback: impl FnOnce(&mut BudgetBucketState) -> PwbResult<R>,
 ) -> PwbResult<R> {
-    let capacity = budget_bucket_capacity(state)?;
+    let capacity = budget_bucket_capacity(state);
     if capacity == 0 {
         return Err(budget_bucket_capacity_exhausted());
     }
@@ -911,31 +909,27 @@ fn checked_mul(left: usize, right: usize) -> PwbResult<usize> {
     })
 }
 
-fn ring_slot(sequence: u64, capacity: usize) -> PwbResult<usize> {
-    let capacity_u64 = u64::try_from(capacity).map_err(|_| PwbError::Internal {
-        message: "ring capacity does not fit u64".to_string(),
-    })?;
-    usize::try_from(sequence % capacity_u64).map_err(|_| PwbError::Internal {
-        message: "ring slot does not fit usize".to_string(),
-    })
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "modulo result is strictly less than the usize capacity"
+)]
+fn ring_slot(sequence: u64, capacity: usize) -> usize {
+    // Callers check the ring capacity once at the boundary; this helper stays infallible for the
+    // shared-memory hot path.
+    debug_assert!(capacity > 0);
+    (sequence % capacity as u64) as usize
 }
 
-fn recent_decision_capacity(state: &PwbSharedState) -> PwbResult<usize> {
-    usize::try_from(state.recent_decision_capacity).map_err(|_| PwbError::Internal {
-        message: "recent decision capacity does not fit usize".to_string(),
-    })
+const fn recent_decision_capacity(state: &PwbSharedState) -> usize {
+    state.recent_decision_capacity as usize
 }
 
-fn recent_decision_count(state: &PwbSharedState) -> PwbResult<usize> {
-    usize::try_from(state.recent_decision_count).map_err(|_| PwbError::Internal {
-        message: "recent decision count does not fit usize".to_string(),
-    })
+const fn recent_decision_count(state: &PwbSharedState) -> usize {
+    state.recent_decision_count as usize
 }
 
-fn budget_bucket_capacity(state: &PwbSharedState) -> PwbResult<usize> {
-    usize::try_from(state.budget_bucket_capacity).map_err(|_| PwbError::Internal {
-        message: "budget bucket capacity does not fit usize".to_string(),
-    })
+const fn budget_bucket_capacity(state: &PwbSharedState) -> usize {
+    state.budget_bucket_capacity as usize
 }
 
 impl PwbRecentDecision {
@@ -1284,10 +1278,10 @@ mod tests {
 
     #[test]
     fn maps_ring_sequence_to_slot() {
-        assert_eq!(ring_slot(0, 4).unwrap_or_else(|error| panic!("{error}")), 0);
-        assert_eq!(ring_slot(3, 4).unwrap_or_else(|error| panic!("{error}")), 3);
-        assert_eq!(ring_slot(4, 4).unwrap_or_else(|error| panic!("{error}")), 0);
-        assert_eq!(ring_slot(9, 4).unwrap_or_else(|error| panic!("{error}")), 1);
+        assert_eq!(ring_slot(0, 4), 0);
+        assert_eq!(ring_slot(3, 4), 3);
+        assert_eq!(ring_slot(4, 4), 0);
+        assert_eq!(ring_slot(9, 4), 1);
     }
 
     #[test]

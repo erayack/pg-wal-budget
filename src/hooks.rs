@@ -183,7 +183,6 @@ fn admit_utility_statement(
 ) -> Result<Option<ActiveStatementState>, AdmissionError> {
     let _guard = AdmissionBypassGuard::enter();
     utility::admit_utility_statement(pstmt, read_only_tree)
-        .map(|admission| admission.map(|admission| admission.active_statement))
 }
 
 fn admit_normal_statement(
@@ -191,9 +190,9 @@ fn admit_normal_statement(
 ) -> Result<Option<ActiveStatementState>, AdmissionError> {
     let _guard = AdmissionBypassGuard::enter();
     // SAFETY: `query_desc` is the pointer PostgreSQL passed to ExecutorStart for this backend.
-    let statement_class = unsafe { classify_planned_statement(query_desc) }?;
-    // SAFETY: `query_desc` is the pointer PostgreSQL passed to ExecutorStart for this backend.
-    let query_id = unsafe { extract_query_id(query_desc) };
+    let planned_statement = unsafe { planned_statement_ref(query_desc) }?;
+    let statement_class = classify_planned_statement(planned_statement);
+    let query_id = extract_query_id(planned_statement);
     let scope = scope::classify_current_scope().map_err(AdmissionError::Internal)?;
     let predicted_wal_bytes =
         predict::predict_wal_bytes(statement_class, query_id, scope.value_hash);
@@ -234,9 +233,9 @@ fn handle_admission_result(
     }
 }
 
-unsafe fn classify_planned_statement(
+unsafe fn planned_statement_ref<'a>(
     query_desc: *mut pg_sys::QueryDesc,
-) -> Result<StatementClass, AdmissionError> {
+) -> Result<&'a pg_sys::PlannedStmt, AdmissionError> {
     if query_desc.is_null() {
         return Err(AdmissionError::Internal(PwbError::Internal {
             message: "executor start received a null QueryDesc".to_string(),
@@ -252,33 +251,23 @@ unsafe fn classify_planned_statement(
     }
 
     // SAFETY: The planned statement pointer was read from a live QueryDesc.
-    let planned_statement = unsafe { &*planned_statement };
+    Ok(unsafe { &*planned_statement })
+}
+
+const fn classify_planned_statement(planned_statement: &pg_sys::PlannedStmt) -> StatementClass {
     match planned_statement.commandType {
-        pg_sys::CmdType::CMD_SELECT if planned_statement.hasModifyingCTE => {
-            Ok(StatementClass::Write)
-        }
-        pg_sys::CmdType::CMD_SELECT => Ok(StatementClass::ReadOnly),
+        pg_sys::CmdType::CMD_SELECT if planned_statement.hasModifyingCTE => StatementClass::Write,
+        pg_sys::CmdType::CMD_SELECT => StatementClass::ReadOnly,
         pg_sys::CmdType::CMD_INSERT
         | pg_sys::CmdType::CMD_UPDATE
         | pg_sys::CmdType::CMD_DELETE
-        | pg_sys::CmdType::CMD_MERGE => Ok(StatementClass::Write),
-        _ => Ok(StatementClass::Unknown),
+        | pg_sys::CmdType::CMD_MERGE => StatementClass::Write,
+        _ => StatementClass::Unknown,
     }
 }
 
-unsafe fn extract_query_id(query_desc: *mut pg_sys::QueryDesc) -> Option<QueryId> {
-    if query_desc.is_null() {
-        return None;
-    }
-
-    // SAFETY: The caller passes PostgreSQL's QueryDesc pointer for the current executor hook.
-    let planned_statement = unsafe { (*query_desc).plannedstmt };
-    if planned_statement.is_null() {
-        return None;
-    }
-
-    // SAFETY: The planned statement pointer was read from a live QueryDesc.
-    let query_id = unsafe { (*planned_statement).queryId };
+const fn extract_query_id(planned_statement: &pg_sys::PlannedStmt) -> Option<QueryId> {
+    let query_id = planned_statement.queryId;
     if query_id == 0 {
         None
     } else {
