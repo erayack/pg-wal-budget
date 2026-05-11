@@ -646,12 +646,9 @@ unsafe fn initialize_state(state: *mut PwbSharedState, layout: SharedLayout) {
             PwbSharedState {
                 magic: MAGIC,
                 layout_version: LAYOUT_VERSION,
-                recent_decision_capacity: u32::try_from(layout.recent_decision_capacity)
-                    .unwrap_or(u32::MAX),
-                profile_cache_capacity: u32::try_from(layout.profile_cache_capacity)
-                    .unwrap_or(u32::MAX),
-                budget_bucket_capacity: u32::try_from(layout.budget_bucket_capacity)
-                    .unwrap_or(u32::MAX),
+                recent_decision_capacity: capacity_to_u32(layout.recent_decision_capacity),
+                profile_cache_capacity: capacity_to_u32(layout.profile_cache_capacity),
+                budget_bucket_capacity: capacity_to_u32(layout.budget_bucket_capacity),
                 recent_decision_head: 0,
                 recent_decision_count: 0,
                 profiles_len: 0,
@@ -722,8 +719,7 @@ fn apply_budget_bucket<R>(
     initializer: impl FnOnce() -> BudgetBucketState,
     callback: impl FnOnce(&mut BudgetBucketState) -> PwbResult<R>,
 ) -> PwbResult<R> {
-    let capacity = budget_bucket_capacity(state);
-    if capacity == 0 {
+    if buckets.is_empty() {
         return Err(budget_bucket_capacity_exhausted());
     }
 
@@ -930,6 +926,15 @@ const fn recent_decision_count(state: &PwbSharedState) -> usize {
 
 const fn budget_bucket_capacity(state: &PwbSharedState) -> usize {
     state.budget_bucket_capacity as usize
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "capacity GUCs are bounded to 1,000,000 before layout construction"
+)]
+const fn capacity_to_u32(capacity: usize) -> u32 {
+    // Shared memory layout capacities are derived from postmaster GUCs with a u32-safe upper bound.
+    capacity as u32
 }
 
 impl PwbRecentDecision {

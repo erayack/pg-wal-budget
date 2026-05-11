@@ -18,10 +18,10 @@ pub(crate) fn admit_utility_statement(
     read_only_tree: bool,
 ) -> Result<Option<ActiveStatementState>, AdmissionError> {
     // SAFETY: `pstmt` is the PlannedStmt pointer PostgreSQL passed to ProcessUtility.
-    let statement_class = unsafe { classify_utility_statement(pstmt, read_only_tree) }
-        .map_err(AdmissionError::Internal)?;
-    // SAFETY: `pstmt` is the PlannedStmt pointer PostgreSQL passed to ProcessUtility.
-    let query_id = unsafe { extract_utility_query_id(pstmt) };
+    let planned_statement =
+        unsafe { planned_statement_ref(pstmt) }.map_err(AdmissionError::Internal)?;
+    let statement_class = classify_utility_statement(planned_statement, read_only_tree);
+    let query_id = extract_utility_query_id(planned_statement);
     let scope = scope::classify_current_scope().map_err(AdmissionError::Internal)?;
     let predicted_wal_bytes =
         predict::predict_wal_bytes(statement_class, query_id, scope.value_hash);
@@ -69,27 +69,21 @@ pub(crate) unsafe fn is_pg_wal_budget_create_extension(pstmt: *mut pg_sys::Plann
     extension_name.to_bytes() == b"pg_wal_budget"
 }
 
-unsafe fn classify_utility_statement(
-    pstmt: *mut pg_sys::PlannedStmt,
+fn classify_utility_statement(
+    planned_statement: &pg_sys::PlannedStmt,
     read_only_tree: bool,
-) -> PwbResult<StatementClass> {
-    // SAFETY: `pstmt` is the PlannedStmt pointer PostgreSQL passed to ProcessUtility.
-    let planned_statement = unsafe { planned_statement_ref(pstmt)? };
+) -> StatementClass {
     if planned_statement.commandType != pg_sys::CmdType::CMD_UTILITY {
-        return Ok(StatementClass::Unknown);
+        return StatementClass::Unknown;
     }
 
     if planned_statement.utilityStmt.is_null() {
-        return Ok(StatementClass::Utility);
+        return StatementClass::Utility;
     }
 
     // SAFETY: utilityStmt is non-null and PostgreSQL Node-compatible for utility planned statements.
     let node = unsafe { &*planned_statement.utilityStmt.cast::<pg_sys::Node>() };
-    Ok(classify_utility_node_tag(
-        node.type_,
-        planned_statement.utilityStmt,
-        read_only_tree,
-    ))
+    classify_utility_node_tag(node.type_, planned_statement.utilityStmt, read_only_tree)
 }
 
 fn classify_utility_node_tag(
@@ -315,9 +309,7 @@ fn def_elem_boolean_value(def_elem: &pg_sys::DefElem) -> Option<bool> {
     Some(unsafe { (*def_elem.arg.cast::<pg_sys::Boolean>()).boolval })
 }
 
-unsafe fn extract_utility_query_id(pstmt: *mut pg_sys::PlannedStmt) -> Option<QueryId> {
-    // SAFETY: `pstmt` is the PlannedStmt pointer PostgreSQL passed to ProcessUtility.
-    let planned_statement = unsafe { planned_statement_ref(pstmt).ok()? };
+const fn extract_utility_query_id(planned_statement: &pg_sys::PlannedStmt) -> Option<QueryId> {
     if planned_statement.queryId == 0 {
         None
     } else {
