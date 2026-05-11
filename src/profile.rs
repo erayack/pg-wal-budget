@@ -7,6 +7,11 @@ use crate::types::{EpochMillis, QueryId, QueryWalProfile, ScopeHash, WalBytes};
 
 pub(crate) const EWMA_ALPHA_NUMERATOR: u64 = 1;
 pub(crate) const EWMA_ALPHA_DENOMINATOR: u64 = 2;
+// Invariant: these compile-time weights satisfy ProfileEwmaWeights::new validation.
+const EWMA_WEIGHTS: shmem::ProfileEwmaWeights = shmem::ProfileEwmaWeights {
+    numerator: EWMA_ALPHA_NUMERATOR,
+    denominator: EWMA_ALPHA_DENOMINATOR,
+};
 
 pub(crate) fn lookup_prediction_profile(
     scope_hash: ScopeHash,
@@ -34,12 +39,8 @@ pub(crate) fn record_observation(
         query_id,
         actual_wal_bytes,
         now_epoch_ms,
-        ewma_weights()?,
+        EWMA_WEIGHTS,
     )
-}
-
-fn ewma_weights() -> PwbResult<shmem::ProfileEwmaWeights> {
-    shmem::ProfileEwmaWeights::new(EWMA_ALPHA_NUMERATOR, EWMA_ALPHA_DENOMINATOR)
 }
 
 #[cfg(test)]

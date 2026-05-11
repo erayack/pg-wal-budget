@@ -224,12 +224,8 @@ const fn is_known_wal_candidate_utility(tag: pg_sys::NodeTag) -> bool {
 
 #[allow(clippy::cast_ptr_alignment)]
 fn classify_copy_statement(utility_stmt: *mut pg_sys::Node) -> StatementClass {
-    if utility_stmt.is_null() {
-        return StatementClass::Copy;
-    }
-
-    // SAFETY: The caller only passes a PostgreSQL-allocated node whose tag is T_CopyStmt, so the
-    // layout and alignment are those of CopyStmt even though the erased pointer type is Node.
+    // SAFETY: `classify_utility_statement` only reaches this helper after checking utilityStmt is
+    // non-null and the Node tag is T_CopyStmt, so the erased pointer has CopyStmt layout/alignment.
     let copy_statement = unsafe { &*utility_stmt.cast::<pg_sys::CopyStmt>() };
     if copy_statement.is_from {
         StatementClass::Copy
@@ -240,12 +236,8 @@ fn classify_copy_statement(utility_stmt: *mut pg_sys::Node) -> StatementClass {
 
 #[allow(clippy::cast_ptr_alignment)]
 fn classify_explain_statement(utility_stmt: *mut pg_sys::Node) -> StatementClass {
-    if utility_stmt.is_null() {
-        return StatementClass::Utility;
-    }
-
-    // SAFETY: The caller only passes a PostgreSQL-allocated node whose tag is T_ExplainStmt, so the
-    // layout and alignment are those of ExplainStmt even though the erased pointer type is Node.
+    // SAFETY: `classify_utility_statement` only reaches this helper after checking utilityStmt is
+    // non-null and the Node tag is T_ExplainStmt, so the erased pointer has ExplainStmt layout.
     let explain_statement = unsafe { &*utility_stmt.cast::<pg_sys::ExplainStmt>() };
     if explain_has_analyze_option(explain_statement) {
         StatementClass::Utility
@@ -367,10 +359,20 @@ mod tests {
     }
 
     #[test]
-    fn classifies_explain_without_statement_as_conservative_utility() {
+    fn classifies_explain_without_analyze_as_read_only() {
+        let mut explain = pg_sys::ExplainStmt {
+            type_: pg_sys::NodeTag::T_ExplainStmt,
+            query: core::ptr::null_mut(),
+            options: core::ptr::null_mut(),
+        };
+
         assert_eq!(
-            classify_utility_node_tag(pg_sys::NodeTag::T_ExplainStmt, core::ptr::null_mut(), false),
-            StatementClass::Utility
+            classify_utility_node_tag(
+                pg_sys::NodeTag::T_ExplainStmt,
+                core::ptr::addr_of_mut!(explain).cast::<pg_sys::Node>(),
+                false
+            ),
+            StatementClass::ReadOnly
         );
     }
 

@@ -225,8 +225,8 @@ pub(crate) struct RecentDecisionRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProfileEwmaWeights {
-    numerator: u64,
-    denominator: u64,
+    pub(crate) numerator: u64,
+    pub(crate) denominator: u64,
 }
 
 impl ProfileEwmaWeights {
