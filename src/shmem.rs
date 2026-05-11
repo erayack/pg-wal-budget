@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-#![allow(clippy::redundant_pub_crate)]
 
 use core::mem::{align_of, size_of};
 use core::ptr;

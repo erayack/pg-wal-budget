@@ -1,5 +1,3 @@
-#![allow(clippy::redundant_pub_crate)]
-
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::types::EpochMillis;

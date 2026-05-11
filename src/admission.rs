@@ -1,5 +1,3 @@
-#![allow(clippy::redundant_pub_crate)]
-
 use crate::budget::{self, BudgetAdmission};
 use crate::errors::PwbError;
 use crate::policy;

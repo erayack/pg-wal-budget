@@ -40,6 +40,7 @@ perf = { level = "deny", priority = 9 }
 pedantic = { level = "warn", priority = 3 }
 nursery = { level = "warn", priority = 2 }
 needless_collect = { level = "deny", priority = 11 }
+redundant_pub_crate = { level = "allow", priority = 12 }
 redundant_clone = { level = "deny", priority = 11 }
 unnecessary_wraps = { level = "deny", priority = 11 }
 unwrap_used = { level = "deny", priority = 8 }

@@ -1,5 +1,3 @@
-#![allow(clippy::redundant_pub_crate)]
-
 use pgrx::pg_sys;
 
 use crate::admission;

@@ -1,5 +1,3 @@
-#![allow(clippy::redundant_pub_crate)]
-
 use std::cell::RefCell;
 
 use pgrx::pg_sys;

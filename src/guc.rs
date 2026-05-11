@@ -1,5 +1,3 @@
-#![allow(clippy::redundant_pub_crate)]
-
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 
 use crate::types::WalBytes;

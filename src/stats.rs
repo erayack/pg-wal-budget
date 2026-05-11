@@ -1,5 +1,3 @@
-#![allow(clippy::redundant_pub_crate)]
-
 use pgrx::iter::TableIterator;
 use pgrx::prelude::*;
 use pgrx::{PgLogLevel, PgSqlErrorCode, ereport, pg_sys};

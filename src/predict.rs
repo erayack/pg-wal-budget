@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-#![allow(clippy::redundant_pub_crate)]
 
 use crate::guc;
 use crate::profile;
