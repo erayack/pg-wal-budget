@@ -1,11 +1,10 @@
 #![allow(clippy::redundant_pub_crate)]
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::budget::{self, BudgetAdmission};
 use crate::errors::PwbError;
 use crate::policy;
 use crate::shmem::{self, CounterDelta, RecentDecisionRecord};
+use crate::time;
 use crate::types::{
     ActiveStatementOrigin, ActiveStatementState, AdmissionContext, AdmissionDecision, DecisionKind,
     EpochMillis, ScopeKind, StatementClass, WalBytes, WalMeasurementKind,
@@ -25,7 +24,7 @@ pub(crate) fn admit_context(
     context: &AdmissionContext,
     origin: ActiveStatementOrigin,
 ) -> Result<ActiveStatementState, AdmissionError> {
-    let now_epoch_ms = current_epoch_ms();
+    let now_epoch_ms = time::current_epoch_ms();
 
     let Some(effective_policy) =
         policy::effective_policy_for_scope(&context.scope).map_err(AdmissionError::Internal)?
@@ -88,7 +87,7 @@ pub(crate) fn admit_context(
 }
 
 pub(crate) fn record_internal_fail_open() {
-    let now_epoch_ms = current_epoch_ms();
+    let now_epoch_ms = time::current_epoch_ms();
     let decision = AdmissionDecision::internal_error_fail_open();
     let _ = shmem::add_counters(CounterDelta {
         accepted_statements: 1,
@@ -204,12 +203,4 @@ fn record_admission_decision(
         available_after,
         reason_code: decision.reason_code,
     });
-}
-
-pub(crate) fn current_epoch_ms() -> EpochMillis {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            EpochMillis::try_from(duration.as_millis()).unwrap_or(EpochMillis::MAX)
-        })
 }

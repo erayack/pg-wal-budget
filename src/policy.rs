@@ -2,7 +2,6 @@
 #![allow(clippy::redundant_pub_crate)]
 
 use std::cell::RefCell;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
@@ -12,6 +11,7 @@ use pgrx::{PgLogLevel, PgSqlErrorCode, Spi, ereport};
 use crate::budget::EffectivePolicy;
 use crate::errors::{PwbError, PwbResult};
 use crate::hooks;
+use crate::time;
 use crate::types::{BudgetMode, EpochMillis, PolicyId, ScopeKey, ScopeKind, WalBytes};
 
 const POLICY_CACHE_REFRESH_INTERVAL_MS: EpochMillis = 1000;
@@ -93,7 +93,7 @@ pub(crate) fn validate_policy_mode(mode: &str) -> PwbResult<BudgetMode> {
 }
 
 pub(crate) fn effective_policy_for_scope(scope: &ScopeKey) -> PwbResult<Option<EffectivePolicy>> {
-    let now_epoch_ms = current_epoch_ms();
+    let now_epoch_ms = time::current_epoch_ms();
 
     let should_reload = POLICY_CACHE.with(|cache| {
         cache
@@ -131,7 +131,7 @@ fn load_policy_cache(now_epoch_ms: EpochMillis) -> PwbResult<PolicyCache> {
         });
     }
 
-    let raw_policy = Spi::connect(|client| {
+    let raw_policies = Spi::connect(|client| {
         let table = client.select(
             "
                 select
@@ -166,8 +166,8 @@ fn load_policy_cache(now_epoch_ms: EpochMillis) -> PwbResult<PolicyCache> {
     })
     .map_err(spi_error)?;
 
-    let mut policies = Vec::with_capacity(raw_policy.len());
-    for raw_policy in raw_policy {
+    let mut policies = Vec::with_capacity(raw_policies.len());
+    for raw_policy in raw_policies {
         policies.push(decode_cached_policy(raw_policy)?);
     }
 
@@ -414,14 +414,6 @@ fn normalize_scope_value(scope_value: Option<&str>) -> Option<String> {
 
 fn nullable_text_arg(value: Option<&str>) -> DatumWithOid<'_> {
     value.map_or_else(DatumWithOid::null::<String>, DatumWithOid::from)
-}
-
-fn current_epoch_ms() -> EpochMillis {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            EpochMillis::try_from(duration.as_millis()).unwrap_or(EpochMillis::MAX)
-        })
 }
 
 fn require_policy_updated(policy_id: PolicyId, updated: Option<bool>) -> PwbResult<()> {

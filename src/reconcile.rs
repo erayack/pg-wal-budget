@@ -7,6 +7,7 @@ use crate::budget;
 use crate::errors::PwbResult;
 use crate::profile;
 use crate::shmem::{self, CounterDelta, RecentDecisionRecord};
+use crate::time;
 use crate::types::{ActiveStatementState, DecisionKind, WalBytes, WalMeasurementKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,7 +43,7 @@ pub(crate) fn reconcile_completed_statement(statement: &ActiveStatementState) {
     };
 
     let actual_wal_bytes = wal_delta(start_wal_bytes, end_wal_bytes);
-    let now_epoch_ms = admission::current_epoch_ms();
+    let now_epoch_ms = time::current_epoch_ms();
     let debt_bytes = exact_reconciliation_debt_bytes(statement, actual_wal_bytes);
 
     record_reconciliation_result(&shmem::add_counters(CounterDelta {
@@ -184,6 +185,7 @@ fn current_measurement_for_kind(kind: WalMeasurementKind) -> Option<WalBytes> {
 }
 
 #[cfg(feature = "pg17")]
+#[allow(clippy::unnecessary_wraps)]
 fn current_backend_wal_bytes() -> Option<WalBytes> {
     // SAFETY: `pgWalUsage` is PostgreSQL's backend-local WAL usage accumulator for the current
     // process. Reading its `wal_bytes` field is a non-mutating snapshot taken inside a live

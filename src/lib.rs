@@ -14,6 +14,7 @@ pub(crate) mod reconcile;
 pub(crate) mod scope;
 pub(crate) mod shmem;
 pub(crate) mod stats;
+pub(crate) mod time;
 pub(crate) mod types;
 pub(crate) mod utility;
 

@@ -349,10 +349,7 @@ pub(crate) fn reset_stats() -> PwbResult<()> {
 
 pub(crate) fn record_recent_decision(record: RecentDecisionRecord) -> PwbResult<()> {
     with_locked_state(|state, recent_decisions, _profiles| {
-        let capacity =
-            usize::try_from(state.recent_decision_capacity).map_err(|_| PwbError::Internal {
-                message: "recent decision capacity does not fit usize".to_string(),
-            })?;
+        let capacity = recent_decision_capacity(state)?;
         if capacity == 0 {
             return Ok(());
         }
@@ -376,18 +373,12 @@ pub(crate) fn record_recent_decision(record: RecentDecisionRecord) -> PwbResult<
 
 pub(crate) fn snapshot_recent_decisions(limit: usize) -> PwbResult<Vec<RecentDecisionRecord>> {
     with_locked_state(|state, recent_decisions, _profiles| {
-        let capacity =
-            usize::try_from(state.recent_decision_capacity).map_err(|_| PwbError::Internal {
-                message: "recent decision capacity does not fit usize".to_string(),
-            })?;
+        let capacity = recent_decision_capacity(state)?;
         if capacity == 0 || limit == 0 {
             return Ok(Vec::new());
         }
 
-        let count =
-            usize::try_from(state.recent_decision_count).map_err(|_| PwbError::Internal {
-                message: "recent decision count does not fit usize".to_string(),
-            })?;
+        let count = recent_decision_count(state)?;
         let snapshot_count = limit.min(count).min(capacity);
         let mut records = Vec::with_capacity(snapshot_count);
 
@@ -733,10 +724,7 @@ fn apply_budget_bucket<R>(
     initializer: impl FnOnce() -> BudgetBucketState,
     callback: impl FnOnce(&mut BudgetBucketState) -> PwbResult<R>,
 ) -> PwbResult<R> {
-    let capacity =
-        usize::try_from(state.budget_bucket_capacity).map_err(|_| PwbError::Internal {
-            message: "budget bucket capacity does not fit usize".to_string(),
-        })?;
+    let capacity = budget_bucket_capacity(state)?;
     if capacity == 0 {
         return Err(budget_bucket_capacity_exhausted());
     }
@@ -929,6 +917,24 @@ fn ring_slot(sequence: u64, capacity: usize) -> PwbResult<usize> {
     })?;
     usize::try_from(sequence % capacity_u64).map_err(|_| PwbError::Internal {
         message: "ring slot does not fit usize".to_string(),
+    })
+}
+
+fn recent_decision_capacity(state: &PwbSharedState) -> PwbResult<usize> {
+    usize::try_from(state.recent_decision_capacity).map_err(|_| PwbError::Internal {
+        message: "recent decision capacity does not fit usize".to_string(),
+    })
+}
+
+fn recent_decision_count(state: &PwbSharedState) -> PwbResult<usize> {
+    usize::try_from(state.recent_decision_count).map_err(|_| PwbError::Internal {
+        message: "recent decision count does not fit usize".to_string(),
+    })
+}
+
+fn budget_bucket_capacity(state: &PwbSharedState) -> PwbResult<usize> {
+    usize::try_from(state.budget_bucket_capacity).map_err(|_| PwbError::Internal {
+        message: "budget bucket capacity does not fit usize".to_string(),
     })
 }
 

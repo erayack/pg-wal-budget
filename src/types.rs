@@ -222,7 +222,7 @@ pub(crate) enum ActiveStatementOrigin {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WalMeasurementKind {
-    /// Exact per-backend WAL accounting from PostgreSQL's backend-local WAL usage accumulator.
+    /// Exact per-backend WAL accounting from the backend-local WAL usage accumulator.
     ExactBackend,
     ApproximateInsertLsn,
     Unavailable,

@@ -45,28 +45,15 @@ pub(crate) fn install_hooks() {
 }
 
 #[pgrx::pg_guard]
+#[allow(clippy::collapsible_if)]
 unsafe extern "C-unwind" fn executor_start_hook(
     query_desc: *mut pg_sys::QueryDesc,
     eflags: core::ffi::c_int,
 ) {
     if guc::enabled() && !admission_is_bypassed() {
-        match admit_normal_statement(query_desc) {
-            Ok(Some(active_statement)) => {
-                push_active_statement(reconcile::capture_start(active_statement));
-            }
-            Ok(None) => {}
-            Err(AdmissionError::Rejected {
-                policy_id,
-                predicted_wal_bytes,
-                available_wal_bytes,
-            }) => {
-                raise_pwb_error(PwbError::BudgetExceeded {
-                    policy_id,
-                    predicted_wal_bytes,
-                    available_wal_bytes,
-                });
-            }
-            Err(AdmissionError::Internal(error)) => handle_internal_admission_error(error),
+        if let Some(active_statement) = handle_admission_result(admit_normal_statement(query_desc))
+        {
+            push_active_statement(reconcile::capture_start(active_statement));
         }
     }
 
@@ -116,29 +103,13 @@ unsafe extern "C-unwind" fn process_utility_hook(
         let bypass_extension_install = unsafe { utility::is_pg_wal_budget_create_extension(pstmt) };
         if bypass_extension_install {
             false
+        } else if let Some(active_statement) =
+            handle_admission_result(admit_utility_statement(pstmt, read_only_tree))
+        {
+            push_active_statement(reconcile::capture_start(active_statement));
+            true
         } else {
-            match admit_utility_statement(pstmt, read_only_tree) {
-                Ok(Some(active_statement)) => {
-                    push_active_statement(reconcile::capture_start(active_statement));
-                    true
-                }
-                Ok(None) => false,
-                Err(AdmissionError::Rejected {
-                    policy_id,
-                    predicted_wal_bytes,
-                    available_wal_bytes,
-                }) => {
-                    raise_pwb_error(PwbError::BudgetExceeded {
-                        policy_id,
-                        predicted_wal_bytes,
-                        available_wal_bytes,
-                    });
-                }
-                Err(AdmissionError::Internal(error)) => {
-                    handle_internal_admission_error(error);
-                    false
-                }
-            }
+            false
         }
     } else {
         false
@@ -238,6 +209,29 @@ fn admit_normal_statement(
 pub(crate) fn with_admission_bypass<R>(callback: impl FnOnce() -> R) -> R {
     let _guard = AdmissionBypassGuard::enter();
     callback()
+}
+
+fn handle_admission_result(
+    result: Result<Option<ActiveStatementState>, AdmissionError>,
+) -> Option<ActiveStatementState> {
+    match result {
+        Ok(active_statement) => active_statement,
+        Err(AdmissionError::Rejected {
+            policy_id,
+            predicted_wal_bytes,
+            available_wal_bytes,
+        }) => {
+            raise_pwb_error(PwbError::BudgetExceeded {
+                policy_id,
+                predicted_wal_bytes,
+                available_wal_bytes,
+            });
+        }
+        Err(AdmissionError::Internal(error)) => {
+            handle_internal_admission_error(error);
+            None
+        }
+    }
 }
 
 unsafe fn classify_planned_statement(
