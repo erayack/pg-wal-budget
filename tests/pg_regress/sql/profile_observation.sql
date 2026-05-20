@@ -1,0 +1,48 @@
+create extension if not exists pg_wal_budget;
+
+set compute_query_id = on;
+
+truncate table pwb.policy restart identity cascade;
+select pwb.reset_stats();
+select pwb.reset_profiles();
+
+select pwb.create_policy('role', current_user, 1073741824, 1073741824, 'observe', 100) as observe_policy_id;
+
+create temp table pwb_profile_observation_test (
+  id integer generated always as identity,
+  value text
+);
+
+prepare pwb_profile_insert(text) as
+  insert into pwb_profile_observation_test (value) values ($1);
+
+execute pwb_profile_insert('profile-a');
+execute pwb_profile_insert('profile-b');
+execute pwb_profile_insert('profile-c');
+execute pwb_profile_insert('profile-d');
+execute pwb_profile_insert('profile-e');
+
+select count(*) as inserted_rows from pwb_profile_observation_test;
+
+select
+  exists (
+    select 1
+    from pwb.query_profiles()
+    where not is_global
+      and calls >= 1
+      and ewma_wal_bytes > 0
+      and max_wal_bytes >= ewma_wal_bytes
+  ) as scoped_profile_observed,
+  exists (
+    select 1
+    from pwb.query_profiles()
+    where is_global
+      and calls >= 1
+      and ewma_wal_bytes > 0
+      and max_wal_bytes >= ewma_wal_bytes
+  ) as global_profile_observed;
+
+select
+  actual_wal_bytes > 0 as actual_wal_recorded,
+  absolute_prediction_error >= 0 as prediction_error_recorded
+from pwb.counters();

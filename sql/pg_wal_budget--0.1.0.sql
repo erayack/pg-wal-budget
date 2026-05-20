@@ -48,16 +48,19 @@ create function pwb.create_policy(
   priority integer default 100
 ) returns integer
 language c
+security definer
 as 'MODULE_PATHNAME', 'pwb_create_policy_wrapper';
 
 create function pwb.set_policy_mode(policy_id integer, mode text)
 returns void
 language c
+security definer
 as 'MODULE_PATHNAME', 'pwb_set_policy_mode_wrapper';
 
 create function pwb.disable_policy(policy_id integer)
 returns void
 language c
+security definer
 as 'MODULE_PATHNAME', 'pwb_disable_policy_wrapper';
 
 create function pwb.set_tenant(tenant text)
@@ -175,3 +178,69 @@ select *
   from pwb.policy
  where enabled
  order by priority desc, policy_id asc;
+
+do $$
+declare
+  role_marker constant text = 'pg_wal_budget extension managed role';
+begin
+  if not exists (select 1 from pg_roles where rolname = 'pwb_admin') then
+    create role pwb_admin;
+    comment on role pwb_admin is 'pg_wal_budget extension managed role';
+  elsif coalesce(shobj_description('pwb_admin'::regrole, 'pg_authid'), '') <> role_marker then
+    raise exception 'role "pwb_admin" already exists and is not managed by pg_wal_budget';
+  end if;
+  if not exists (select 1 from pg_roles where rolname = 'pwb_monitor') then
+    create role pwb_monitor;
+    comment on role pwb_monitor is 'pg_wal_budget extension managed role';
+  elsif coalesce(shobj_description('pwb_monitor'::regrole, 'pg_authid'), '') <> role_marker then
+    raise exception 'role "pwb_monitor" already exists and is not managed by pg_wal_budget';
+  end if;
+  if not exists (select 1 from pg_roles where rolname = 'pwb_tenant_setter') then
+    create role pwb_tenant_setter;
+    comment on role pwb_tenant_setter is 'pg_wal_budget extension managed role';
+  elsif coalesce(shobj_description('pwb_tenant_setter'::regrole, 'pg_authid'), '') <> role_marker then
+    raise exception 'role "pwb_tenant_setter" already exists and is not managed by pg_wal_budget';
+  end if;
+end;
+$$;
+
+revoke all on schema pwb from public;
+grant usage on schema pwb to public;
+grant usage on schema pwb to pwb_admin, pwb_monitor, pwb_tenant_setter;
+
+revoke all on table pwb.policy from public;
+grant select on table pwb.policy to pwb_admin, pwb_monitor;
+
+revoke all on pwb.active_policy_precedence from public;
+grant select on pwb.active_policy_precedence to pwb_admin, pwb_monitor;
+
+revoke all on function pwb.create_policy(text, text, bigint, bigint, text, integer) from public;
+revoke all on function pwb.set_policy_mode(integer, text) from public;
+revoke all on function pwb.disable_policy(integer) from public;
+grant execute on function pwb.create_policy(text, text, bigint, bigint, text, integer) to pwb_admin;
+grant execute on function pwb.set_policy_mode(integer, text) to pwb_admin;
+grant execute on function pwb.disable_policy(integer) to pwb_admin;
+
+revoke all on function pwb.set_tenant(text) from public;
+revoke all on function pwb.clear_tenant() from public;
+grant execute on function pwb.set_tenant(text) to pwb_admin, pwb_tenant_setter;
+grant execute on function pwb.clear_tenant() to pwb_admin, pwb_tenant_setter;
+
+revoke all on function pwb.policies() from public;
+revoke all on function pwb.counters() from public;
+revoke all on function pwb.scope_stats() from public;
+revoke all on function pwb.query_profiles() from public;
+revoke all on function pwb.recent_decisions(integer) from public;
+grant execute on function pwb.policies() to pwb_admin, pwb_monitor;
+grant execute on function pwb.counters() to pwb_admin, pwb_monitor;
+grant execute on function pwb.scope_stats() to pwb_admin, pwb_monitor;
+grant execute on function pwb.query_profiles() to pwb_admin, pwb_monitor;
+grant execute on function pwb.recent_decisions(integer) to pwb_admin, pwb_monitor;
+
+revoke all on function pwb.reset_stats() from public;
+revoke all on function pwb.reset_profiles() from public;
+grant execute on function pwb.reset_stats() to pwb_admin;
+grant execute on function pwb.reset_profiles() to pwb_admin;
+
+grant execute on function pwb.version() to public;
+grant execute on function pwb.preload_status() to public;

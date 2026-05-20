@@ -1,0 +1,83 @@
+create extension if not exists pg_wal_budget;
+do $$
+begin
+  if not exists (select 1 from pg_roles where rolname = 'pwb_regress_no_tenant') then
+    create role pwb_regress_no_tenant;
+  end if;
+  if not exists (select 1 from pg_roles where rolname = 'pwb_regress_admin') then
+    create role pwb_regress_admin;
+  end if;
+end;
+$$;
+revoke pwb_tenant_setter from pwb_regress_no_tenant;
+WARNING:  role "pwb_regress_no_tenant" has not been granted membership in role "pwb_tenant_setter" by role "erayack"
+revoke pwb_admin from pwb_regress_admin;
+WARNING:  role "pwb_regress_admin" has not been granted membership in role "pwb_admin" by role "erayack"
+set role pwb_regress_no_tenant;
+\set VERBOSITY sqlstate
+select pwb.set_tenant('tenant-a');
+ERROR:  42501
+\set VERBOSITY default
+reset role;
+grant pwb_tenant_setter to pwb_regress_no_tenant;
+set role pwb_regress_no_tenant;
+select pwb.set_tenant('tenant-a');
+ set_tenant 
+------------
+ 
+(1 row)
+
+select pwb.clear_tenant();
+ clear_tenant 
+--------------
+ 
+(1 row)
+
+reset role;
+grant pwb_admin to pwb_regress_admin;
+set role pwb_regress_admin;
+select pwb.create_policy('role', current_user, 1000, 2000, 'observe', 10) is not null as admin_created_policy;
+ admin_created_policy 
+----------------------
+ t
+(1 row)
+
+select pwb.set_policy_mode(1, 'shadow');
+ set_policy_mode 
+-----------------
+ 
+(1 row)
+
+select pwb.disable_policy(1);
+ disable_policy 
+----------------
+ 
+(1 row)
+
+select pwb.reset_stats();
+ reset_stats 
+-------------
+ 
+(1 row)
+
+select pwb.reset_profiles();
+ reset_profiles 
+----------------
+ 
+(1 row)
+
+select pwb.set_tenant('tenant-admin');
+ set_tenant 
+------------
+ 
+(1 row)
+
+select pwb.clear_tenant();
+ clear_tenant 
+--------------
+ 
+(1 row)
+
+reset role;
+revoke pwb_tenant_setter from pwb_regress_no_tenant;
+revoke pwb_admin from pwb_regress_admin;

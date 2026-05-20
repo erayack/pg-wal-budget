@@ -60,6 +60,18 @@ select pwb.disable_policy(1);
 - Matching: highest `priority` wins; ties resolved by lowest `policy_id`.
 - Tenant scope is trusted backend-local state; set via `pwb.set_tenant(...)` / `pwb.clear_tenant()`. Restricted to superusers and members of `pwb_tenant_setter`.
 
+## Privileges
+
+The extension install creates three operational roles:
+
+| Role | Purpose |
+| --- | --- |
+| `pwb_admin` | Manage policies, reset shared-memory stats/profiles, and use trusted tenant setters. |
+| `pwb_monitor` | Read policies and operational telemetry. |
+| `pwb_tenant_setter` | Set or clear trusted backend-local tenant scope. |
+
+`pwb.version()` and `pwb.preload_status()` remain public. Policy mutation, detailed telemetry, and reset functions are revoked from `public`; grant the roles above to operational users instead of granting direct table access. If an install finds an existing unmarked `pwb_admin`, `pwb_monitor`, or `pwb_tenant_setter` role, it fails rather than adopting that role implicitly.
+
 ## Configuration
 
 Runtime GUCs (SIGHUP):
@@ -96,8 +108,8 @@ select * from pwb.scope_stats();
 select * from pwb.query_profiles();
 select * from pwb.recent_decisions(100);
 
-select pwb.reset_stats();      -- superuser
-select pwb.reset_profiles();   -- superuser
+select pwb.reset_stats();      -- superuser or pwb_admin
+select pwb.reset_profiles();   -- superuser or pwb_admin
 ```
 
 Recent decisions expose query hashes, query IDs, and workload classifications; treat as operational telemetry and restrict access in production.
@@ -115,6 +127,19 @@ Recent decisions expose query hashes, query IDs, and workload classifications; t
 
 ```sh
 cargo check --no-default-features --features 'pg17 pg_test'
-cargo pgrx regress pg17 --resetdb --postgresql-conf shared_preload_libraries=pg_wal_budget
+cargo pgrx regress pg17 --resetdb \
+  --postgresql-conf shared_preload_libraries=pg_wal_budget \
+  --postgresql-conf compute_query_id=on
 cargo fmt --all
 ```
+
+## Calibration
+
+Run repeatable local workloads before enabling reject mode for real traffic:
+
+```sh
+cargo pgrx run pg17 --postgresql-conf shared_preload_libraries=pg_wal_budget
+\i tests/workloads/calibration_summary.sql
+```
+
+The workload scripts report predicted WAL, actual WAL, absolute error, and error ratio for insert-heavy, HOT update, indexed update, wide-row update, `COPY`, and `CREATE INDEX` paths. Use those results to tune `pwb.default_write_wal_bytes` and `pwb.default_utility_wal_bytes`; do not treat first-run defaults as safe reject-mode thresholds.

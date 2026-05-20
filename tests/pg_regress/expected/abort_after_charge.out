@@ -1,0 +1,53 @@
+create extension if not exists pg_wal_budget;
+truncate table pwb.policy restart identity cascade;
+select pwb.reset_stats();
+ reset_stats 
+-------------
+ 
+(1 row)
+
+select pwb.reset_profiles();
+ reset_profiles 
+----------------
+ 
+(1 row)
+
+create temp table pwb_abort_after_charge_test (
+  id integer primary key,
+  value text
+);
+insert into pwb_abort_after_charge_test values (1, 'seed');
+select pwb.reset_stats();
+ reset_stats 
+-------------
+ 
+(1 row)
+
+select pwb.create_policy('role', current_user, 1073741824, 1073741824, 'reject', 100) as reject_policy_id;
+ reject_policy_id 
+------------------
+                1
+(1 row)
+
+begin;
+\set VERBOSITY sqlstate
+insert into pwb_abort_after_charge_test values (1, 'duplicate');
+ERROR:  23505
+\set VERBOSITY default
+rollback;
+insert into pwb_abort_after_charge_test values (2, 'after-rollback');
+select count(*) as surviving_rows from pwb_abort_after_charge_test;
+ surviving_rows 
+----------------
+              2
+(1 row)
+
+select
+  accepted_statements > 0 as accepted_recorded,
+  rejected_statements = 0 as no_budget_rejections
+from pwb.counters();
+ accepted_recorded | no_budget_rejections 
+-------------------+----------------------
+ t                 | t
+(1 row)
+

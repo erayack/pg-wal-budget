@@ -9,6 +9,7 @@ pub(crate) mod guc;
 pub(crate) mod hooks;
 pub(crate) mod policy;
 pub(crate) mod predict;
+pub(crate) mod privileges;
 pub(crate) mod profile;
 pub(crate) mod reconcile;
 pub(crate) mod scope;

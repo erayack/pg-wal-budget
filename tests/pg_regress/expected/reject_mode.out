@@ -1,0 +1,211 @@
+create extension if not exists pg_wal_budget;
+truncate table pwb.policy restart identity cascade;
+select pwb.reset_stats();
+ reset_stats 
+-------------
+ 
+(1 row)
+
+select pwb.reset_profiles();
+ reset_profiles 
+----------------
+ 
+(1 row)
+
+create temp table pwb_reject_blocked_test (id integer generated always as identity, value text);
+select pwb.reset_stats();
+ reset_stats 
+-------------
+ 
+(1 row)
+
+select pwb.create_policy('role', current_user, 1, 1, 'reject', 100) as reject_policy_id;
+ reject_policy_id 
+------------------
+                1
+(1 row)
+
+\set VERBOSITY sqlstate
+insert into pwb_reject_blocked_test (value) values ('blocked');
+ERROR:  P0001
+\set VERBOSITY default
+select count(*) as inserted_rows from pwb_reject_blocked_test;
+ inserted_rows 
+---------------
+             0
+(1 row)
+
+select
+  rejected_statements > 0 as rejection_recorded,
+  shadow_would_reject_count = 0 as no_shadow_rejections,
+  predicted_wal_bytes > 0 as prediction_recorded
+from pwb.counters();
+ rejection_recorded | no_shadow_rejections | prediction_recorded 
+--------------------+----------------------+---------------------
+ t                  | t                    | t
+(1 row)
+
+select
+  exists (
+    select 1
+    from pwb.recent_decisions(20)
+    where policy_id = 1
+      and decision_kind = 'rejected'
+      and reason_code = 'budget_exceeded'
+      and statement_class = 'write'
+      and predicted_wal_bytes > available_before
+      and available_before = available_after
+  ) as reject_decision_recorded;
+ reject_decision_recorded 
+--------------------------
+ t
+(1 row)
+
+select pwb.set_policy_mode(1, 'observe');
+ set_policy_mode 
+-----------------
+ 
+(1 row)
+
+truncate table pwb.policy restart identity cascade;
+select pwb.reset_stats();
+ reset_stats 
+-------------
+ 
+(1 row)
+
+select pwb.reset_profiles();
+ reset_profiles 
+----------------
+ 
+(1 row)
+
+create temp table pwb_reject_allowed_test (id integer generated always as identity, value text);
+select pwb.reset_stats();
+ reset_stats 
+-------------
+ 
+(1 row)
+
+select pwb.create_policy('role', current_user, 1073741824, 1073741824, 'reject', 100) as reject_policy_id;
+ reject_policy_id 
+------------------
+                1
+(1 row)
+
+insert into pwb_reject_allowed_test (value) values ('alpha'), ('beta');
+select count(*) as inserted_rows from pwb_reject_allowed_test;
+ inserted_rows 
+---------------
+             2
+(1 row)
+
+select
+  accepted_statements > 0 as accepted_recorded,
+  rejected_statements = 0 as no_rejections,
+  shadow_would_reject_count = 0 as no_shadow_rejections,
+  predicted_wal_bytes > 0 as prediction_recorded
+from pwb.counters();
+ accepted_recorded | no_rejections | no_shadow_rejections | prediction_recorded 
+-------------------+---------------+----------------------+---------------------
+ t                 | t             | t                    | t
+(1 row)
+
+select
+  exists (
+    select 1
+    from pwb.recent_decisions(20)
+    where policy_id = 1
+      and decision_kind = 'allowed'
+      and reason_code = 'budget_available'
+      and statement_class = 'write'
+      and predicted_wal_bytes > 0
+      and available_after < available_before
+      and available_before - available_after = predicted_wal_bytes
+  ) as reject_allowed_recorded;
+ reject_allowed_recorded 
+-------------------------
+ t
+(1 row)
+
+select
+  exists (
+    select 1
+    from pwb.scope_stats()
+    where policy_id = 1
+      and available_bytes < max_burst_bytes
+      and debt_bytes = 0
+  ) as reject_bucket_charged;
+ reject_bucket_charged 
+-----------------------
+ t
+(1 row)
+
+select pwb.set_policy_mode(1, 'observe');
+ set_policy_mode 
+-----------------
+ 
+(1 row)
+
+truncate table pwb.policy restart identity cascade;
+select pwb.reset_stats();
+ reset_stats 
+-------------
+ 
+(1 row)
+
+select pwb.reset_profiles();
+ reset_profiles 
+----------------
+ 
+(1 row)
+
+create temp table pwb_reject_readonly_test (id integer);
+insert into pwb_reject_readonly_test values (1), (2);
+select pwb.reset_stats();
+ reset_stats 
+-------------
+ 
+(1 row)
+
+select pwb.create_policy('role', current_user, 1, 1, 'reject', 100) as reject_policy_id;
+ reject_policy_id 
+------------------
+                1
+(1 row)
+
+select count(*) as readonly_rows from pwb_reject_readonly_test;
+ readonly_rows 
+---------------
+             2
+(1 row)
+
+select
+  rejected_statements = 0 as no_rejections,
+  shadow_would_reject_count = 0 as no_shadow_rejections
+from pwb.counters();
+ no_rejections | no_shadow_rejections 
+---------------+----------------------
+ t             | t
+(1 row)
+
+select
+  exists (
+    select 1
+    from pwb.recent_decisions(20)
+    where policy_id = 1
+      and decision_kind = 'allowed'
+      and statement_class = 'read_only'
+      and predicted_wal_bytes = 0
+  ) as read_only_allowed_recorded;
+ read_only_allowed_recorded 
+----------------------------
+ t
+(1 row)
+
+select pwb.set_policy_mode(1, 'observe');
+ set_policy_mode 
+-----------------
+ 
+(1 row)
+

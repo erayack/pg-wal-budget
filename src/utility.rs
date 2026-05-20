@@ -20,6 +20,9 @@ pub(crate) fn admit_utility_statement(
     let planned_statement =
         unsafe { planned_statement_ref(pstmt) }.map_err(AdmissionError::Internal)?;
     let statement_class = classify_utility_statement(planned_statement, read_only_tree);
+    if matches!(statement_class, StatementClass::ReadOnly) {
+        return Ok(None);
+    }
     let query_id = extract_utility_query_id(planned_statement);
     let scope = scope::classify_current_scope().map_err(AdmissionError::Internal)?;
     let predicted_wal_bytes =

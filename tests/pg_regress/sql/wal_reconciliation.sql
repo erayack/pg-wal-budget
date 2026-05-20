@@ -1,0 +1,42 @@
+create extension if not exists pg_wal_budget;
+
+truncate table pwb.policy restart identity cascade;
+select pwb.reset_stats();
+select pwb.reset_profiles();
+
+select pwb.create_policy('role', current_user, 1073741824, 1073741824, 'reject', 100) as reject_policy_id;
+
+create temp table pwb_wal_reconciliation_test (
+  id integer generated always as identity,
+  value text
+);
+
+insert into pwb_wal_reconciliation_test (value)
+select 'wal-' || i::text
+from generate_series(1, 20) as i;
+
+select
+  accepted_statements > 0 as accepted_recorded,
+  actual_wal_bytes > 0 as actual_wal_recorded,
+  absolute_prediction_error >= 0 as prediction_error_recorded,
+  missing_actual_wal_count = 0 as exact_measurement_available,
+  scope_debt_bytes >= 0 as debt_counter_valid
+from pwb.counters();
+
+select
+  exists (
+    select 1
+    from pwb.recent_decisions(20)
+    where policy_id = 1
+      and decision_kind = 'allowed'
+      and statement_class = 'write'
+      and actual_wal_bytes is not null
+  ) as actual_wal_attached_to_decision;
+
+select
+  exists (
+    select 1
+    from pwb.query_profiles()
+    where ewma_wal_bytes > 0
+      and max_wal_bytes >= ewma_wal_bytes
+  ) as profile_observation_recorded;

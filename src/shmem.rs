@@ -428,7 +428,7 @@ pub(crate) fn lookup_query_profile(
             return Ok(None);
         };
 
-        Ok(Some(profiles[slot].decode()?.profile.into()))
+        Ok(Some(profiles[slot].profile.into()))
     })
 }
 
@@ -438,14 +438,14 @@ pub(crate) fn lookup_scoped_or_global_query_profile(
 ) -> PwbResult<Option<QueryWalProfile>> {
     with_locked_state(|_state, _recent_decisions, profiles| {
         if let Some(slot) = find_profile_slot(profiles, Some(scope_hash), query_id) {
-            return Ok(Some(profiles[slot].decode()?.profile.into()));
+            return Ok(Some(profiles[slot].profile.into()));
         }
 
         let Some(slot) = find_profile_slot(profiles, None, query_id) else {
             return Ok(None);
         };
 
-        Ok(Some(profiles[slot].decode()?.profile.into()))
+        Ok(Some(profiles[slot].profile.into()))
     })
 }
 
@@ -527,31 +527,30 @@ fn upsert_query_profile_locked(
     now_epoch_ms: EpochMillis,
     ewma_weights: ProfileEwmaWeights,
 ) -> PwbResult<()> {
-    let slot = if let Some(slot) = find_profile_slot(profiles, scope_hash, query_id) {
-        slot
-    } else if let Some(slot) = find_empty_profile_slot(profiles) {
-        state.profiles_len = state
-            .profiles_len
-            .saturating_add(1)
-            .min(state.profile_cache_capacity);
-        slot
-    } else {
-        find_profile_eviction_slot(profiles).ok_or_else(profile_cache_capacity_exhausted)?
-    };
-
-    let profile = if profiles[slot].occupied == 1 {
-        let mut existing = profiles[slot].decode()?.profile;
-        let mut profile: QueryWalProfile = existing.into();
+    let (slot, profile) = if let Some(slot) = find_profile_slot(profiles, scope_hash, query_id) {
+        // `find_profile_slot` only returns occupied entries matching the trusted profile key.
+        let mut profile: QueryWalProfile = profiles[slot].profile.into();
         profile.record_observation(
             actual_wal_bytes,
             now_epoch_ms,
             ewma_weights.numerator,
             ewma_weights.denominator,
         );
-        existing = profile.into();
-        existing
+        (slot, profile.into())
     } else {
-        QueryWalProfile::new(actual_wal_bytes, now_epoch_ms).into()
+        let slot = if let Some(slot) = find_empty_profile_slot(profiles) {
+            state.profiles_len = state
+                .profiles_len
+                .saturating_add(1)
+                .min(state.profile_cache_capacity);
+            slot
+        } else {
+            find_profile_eviction_slot(profiles).ok_or_else(profile_cache_capacity_exhausted)?
+        };
+        (
+            slot,
+            QueryWalProfile::new(actual_wal_bytes, now_epoch_ms).into(),
+        )
     };
 
     profiles[slot] = PwbProfileEntry::encode(scope_hash, query_id, profile);
@@ -583,7 +582,7 @@ pub(crate) fn with_existing_budget_bucket<R>(
             return Ok(None);
         };
 
-        let mut bucket = buckets[slot].decode()?;
+        let mut bucket = buckets[slot].state();
         let result = callback(&mut bucket)?;
         buckets[slot] = PwbBudgetBucket::encode(bucket);
         Ok(Some(result))
@@ -723,7 +722,7 @@ fn apply_budget_bucket<R>(
     }
 
     if let Some(slot) = find_budget_bucket_slot(buckets, policy_id, scope_hash) {
-        let mut bucket = buckets[slot].decode()?;
+        let mut bucket = buckets[slot].state();
         let result = callback(&mut bucket)?;
         buckets[slot] = PwbBudgetBucket::encode(bucket);
         return Ok(result);
@@ -1039,7 +1038,12 @@ impl PwbBudgetBucket {
             });
         }
 
-        Ok(BudgetBucketState {
+        Ok(self.state())
+    }
+
+    const fn state(self) -> BudgetBucketState {
+        // Callers use this only after `find_budget_bucket_slot` or decode's occupied check.
+        BudgetBucketState {
             policy_id: self.policy_id,
             scope_hash: self.scope_hash,
             available_bytes: self.available_bytes,
@@ -1047,7 +1051,7 @@ impl PwbBudgetBucket {
             rate_bytes_per_sec: self.rate_bytes_per_sec,
             last_refill_epoch_ms: self.last_refill_epoch_ms,
             debt_bytes: self.debt_bytes,
-        })
+        }
     }
 }
 

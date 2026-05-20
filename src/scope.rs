@@ -1,15 +1,15 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 
 use pgrx::prelude::*;
 use pgrx::{PgLogLevel, PgSqlErrorCode, ereport, pg_sys};
 
 use crate::errors::{PwbError, PwbResult};
+use crate::privileges::{self, ADMIN_ROLE, TENANT_SETTER_ROLE};
 use crate::types::{ScopeHash, ScopeKey, ScopeKind};
 
-const TENANT_SETTER_ROLE: &str = "pwb_tenant_setter";
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -88,23 +88,8 @@ fn clear_tenant_impl() -> PwbResult<()> {
 }
 
 fn require_tenant_setter_privilege() -> PwbResult<()> {
-    // SAFETY: PostgreSQL exposes current-user and role-membership state through backend globals
-    // and syscache helpers. This function only reads those values in the current backend.
-    unsafe {
-        if pg_sys::superuser() {
-            return Ok(());
-        }
-
-        let role_name = CString::new(TENANT_SETTER_ROLE).map_err(|error| PwbError::Internal {
-            message: format!("trusted tenant setter role name is invalid: {error}"),
-        })?;
-        let setter_role = pg_sys::get_role_oid(role_name.as_ptr(), true);
-
-        if setter_role != pg_sys::Oid::INVALID
-            && pg_sys::has_privs_of_role(pg_sys::GetUserId(), setter_role)
-        {
-            return Ok(());
-        }
+    if privileges::current_user_is_superuser_or_member_of(&[ADMIN_ROLE, TENANT_SETTER_ROLE])? {
+        return Ok(());
     }
 
     Err(PwbError::InsufficientPrivilege {

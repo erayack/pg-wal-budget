@@ -1,8 +1,9 @@
 use pgrx::iter::TableIterator;
 use pgrx::prelude::*;
-use pgrx::{PgLogLevel, PgSqlErrorCode, ereport, pg_sys};
+use pgrx::{PgLogLevel, PgSqlErrorCode, ereport};
 
 use crate::errors::{PwbError, PwbResult};
+use crate::privileges::{self, ADMIN_ROLE};
 use crate::shmem::{
     self, BudgetBucketSnapshot, PwbCounters, QueryProfileSnapshot, RecentDecisionRecord,
 };
@@ -152,12 +153,12 @@ fn pwb_reset_profiles() {
 }
 
 fn reset_stats_impl() -> PwbResult<()> {
-    require_superuser("reset pg_wal_budget stats")?;
+    require_admin("reset pg_wal_budget stats")?;
     shmem::reset_stats()
 }
 
 fn reset_profiles_impl() -> PwbResult<()> {
-    require_superuser("reset pg_wal_budget query profiles")?;
+    require_admin("reset pg_wal_budget query profiles")?;
     shmem::reset_profiles()
 }
 
@@ -217,9 +218,8 @@ fn recent_decision_row(record: RecentDecisionRecord) -> RecentDecisionRow {
     )
 }
 
-fn require_superuser(operation: &'static str) -> PwbResult<()> {
-    // SAFETY: superuser() reads the current backend's authenticated user state.
-    if unsafe { pg_sys::superuser() } {
+fn require_admin(operation: &'static str) -> PwbResult<()> {
+    if privileges::current_user_is_superuser_or_member_of(&[ADMIN_ROLE])? {
         Ok(())
     } else {
         Err(PwbError::InsufficientPrivilege { operation })
