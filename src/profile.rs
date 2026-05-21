@@ -33,6 +33,15 @@ pub(crate) fn record_observation(
         return Ok(());
     };
 
+    record_query_observation(scope_hash, query_id, actual_wal_bytes, now_epoch_ms)
+}
+
+pub(crate) fn record_query_observation(
+    scope_hash: ScopeHash,
+    query_id: QueryId,
+    actual_wal_bytes: WalBytes,
+    now_epoch_ms: EpochMillis,
+) -> PwbResult<()> {
     shmem::upsert_scoped_and_global_query_profiles(
         scope_hash,
         query_id,

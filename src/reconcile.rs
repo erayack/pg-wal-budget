@@ -6,13 +6,67 @@ use crate::errors::PwbResult;
 use crate::profile;
 use crate::shmem::{self, CounterDelta, RecentDecisionRecord};
 use crate::time;
-use crate::types::{ActiveStatementState, DecisionKind, WalBytes, WalMeasurementKind};
+use crate::types::{
+    ActiveStatementState, DecisionKind, QueryId, ScopeHash, WalBytes, WalMeasurementKind,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BudgetReconciliation {
     None,
     Refund(WalBytes),
     Debt(WalBytes),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExactChargedStatement {
+    policy_id: i32,
+    scope_hash: ScopeHash,
+    charged_bytes: WalBytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExactProfileObservation {
+    scope_hash: ScopeHash,
+    query_id: QueryId,
+}
+
+impl ExactProfileObservation {
+    const fn from_active(statement: &ActiveStatementState) -> Option<Self> {
+        if !matches!(statement.measurement_kind, WalMeasurementKind::ExactBackend) {
+            return None;
+        }
+
+        let Some(query_id) = statement.query_id else {
+            return None;
+        };
+
+        Some(Self {
+            scope_hash: statement.scope_hash,
+            query_id,
+        })
+    }
+}
+
+impl ExactChargedStatement {
+    const fn from_active(statement: &ActiveStatementState) -> Option<Self> {
+        // The insert-LSN fallback is cluster-wide and must never adjust enforcement buckets.
+        if !matches!(statement.decision.kind, DecisionKind::Allowed)
+            || statement.decision.charged_bytes == 0
+            || !matches!(statement.measurement_kind, WalMeasurementKind::ExactBackend)
+        {
+            return None;
+        }
+
+        let Some(policy_id) = statement.decision.policy_id else {
+            return None;
+        };
+
+        Some(Self {
+            policy_id,
+            scope_hash: statement.scope_hash,
+            charged_bytes: statement.decision.charged_bytes,
+        })
+    }
 }
 
 pub(crate) fn capture_start(mut statement: ActiveStatementState) -> ActiveStatementState {
@@ -42,7 +96,10 @@ pub(crate) fn reconcile_completed_statement(statement: &ActiveStatementState) {
 
     let actual_wal_bytes = wal_delta(start_wal_bytes, end_wal_bytes);
     let now_epoch_ms = time::current_epoch_ms();
-    let debt_bytes = exact_reconciliation_debt_bytes(statement, actual_wal_bytes);
+    let exact_charge = ExactChargedStatement::from_active(statement);
+    let debt_bytes = exact_charge.map_or(0, |charge| {
+        exact_reconciliation_debt_bytes(charge, actual_wal_bytes)
+    });
 
     record_reconciliation_result(&shmem::add_counters(CounterDelta {
         actual_wal_bytes,
@@ -69,16 +126,18 @@ pub(crate) fn reconcile_completed_statement(statement: &ActiveStatementState) {
         reason_code: statement.decision.reason_code,
     }));
 
-    if should_record_profile_observation(statement) {
-        record_reconciliation_result(&profile::record_observation(
-            statement.scope_hash,
-            statement.query_id,
+    if let Some(observation) = ExactProfileObservation::from_active(statement) {
+        record_reconciliation_result(&profile::record_query_observation(
+            observation.scope_hash,
+            observation.query_id,
             actual_wal_bytes,
             now_epoch_ms,
         ));
     }
 
-    record_reconciliation_result(&reconcile_budget(statement, actual_wal_bytes));
+    if let Some(charge) = exact_charge {
+        record_reconciliation_result(&reconcile_budget(charge, actual_wal_bytes));
+    }
 }
 
 pub(crate) fn record_aborted_statement(statement: &ActiveStatementState) -> PwbResult<()> {
@@ -92,38 +151,18 @@ pub(crate) fn record_aborted_statement(statement: &ActiveStatementState) -> PwbR
     Ok(())
 }
 
-fn reconcile_budget(statement: &ActiveStatementState, actual_wal_bytes: WalBytes) -> PwbResult<()> {
-    if !should_reconcile_budget(statement) {
-        return Ok(());
-    }
-
-    let Some(policy_id) = statement.decision.policy_id else {
-        return Ok(());
-    };
-
-    match budget_reconciliation(statement, actual_wal_bytes) {
+fn reconcile_budget(charge: ExactChargedStatement, actual_wal_bytes: WalBytes) -> PwbResult<()> {
+    match budget_reconciliation(charge, actual_wal_bytes) {
         BudgetReconciliation::None => {}
         BudgetReconciliation::Refund(refund_bytes) => {
-            budget::refund_charged_bytes(policy_id, statement.scope_hash, refund_bytes)?;
+            budget::refund_charged_bytes(charge.policy_id, charge.scope_hash, refund_bytes)?;
         }
         BudgetReconciliation::Debt(debt_bytes) => {
-            budget::record_underprediction_debt(policy_id, statement.scope_hash, debt_bytes)?;
+            budget::record_underprediction_debt(charge.policy_id, charge.scope_hash, debt_bytes)?;
         }
     }
 
     Ok(())
-}
-
-const fn should_record_profile_observation(statement: &ActiveStatementState) -> bool {
-    matches!(statement.measurement_kind, WalMeasurementKind::ExactBackend)
-        && statement.query_id.is_some()
-}
-
-const fn should_reconcile_budget(statement: &ActiveStatementState) -> bool {
-    // The insert-LSN fallback is cluster-wide and must never adjust enforcement buckets.
-    matches!(statement.decision.kind, DecisionKind::Allowed)
-        && statement.decision.charged_bytes > 0
-        && matches!(statement.measurement_kind, WalMeasurementKind::ExactBackend)
 }
 
 const fn wal_delta(start: WalBytes, end: WalBytes) -> WalBytes {
@@ -135,28 +174,20 @@ const fn prediction_error(predicted: WalBytes, actual: WalBytes) -> WalBytes {
 }
 
 const fn exact_reconciliation_debt_bytes(
-    statement: &ActiveStatementState,
+    charge: ExactChargedStatement,
     actual_wal_bytes: WalBytes,
 ) -> WalBytes {
-    if should_reconcile_budget(statement) && actual_wal_bytes > statement.decision.charged_bytes {
-        actual_wal_bytes - statement.decision.charged_bytes
-    } else {
-        0
-    }
+    actual_wal_bytes.saturating_sub(charge.charged_bytes)
 }
 
 const fn budget_reconciliation(
-    statement: &ActiveStatementState,
+    charge: ExactChargedStatement,
     actual_wal_bytes: WalBytes,
 ) -> BudgetReconciliation {
-    if !should_reconcile_budget(statement) {
-        return BudgetReconciliation::None;
-    }
-
-    if actual_wal_bytes < statement.decision.charged_bytes {
-        BudgetReconciliation::Refund(statement.decision.charged_bytes - actual_wal_bytes)
-    } else if actual_wal_bytes > statement.decision.charged_bytes {
-        BudgetReconciliation::Debt(actual_wal_bytes - statement.decision.charged_bytes)
+    if actual_wal_bytes < charge.charged_bytes {
+        BudgetReconciliation::Refund(charge.charged_bytes - actual_wal_bytes)
+    } else if actual_wal_bytes > charge.charged_bytes {
+        BudgetReconciliation::Debt(actual_wal_bytes - charge.charged_bytes)
     } else {
         BudgetReconciliation::None
     }
@@ -226,23 +257,30 @@ mod tests {
     }
 
     #[test]
-    fn only_reconciles_budget_for_charged_allowed_statements() {
+    fn builds_exact_charged_statement_only_for_exact_charged_allowed_statements() {
         let mut statement = test_statement(AdmissionDecision::allowed(
             Some(7),
             100,
             ReasonCode::BudgetAvailable,
         ));
-        assert!(should_reconcile_budget(&statement));
+        assert_eq!(
+            ExactChargedStatement::from_active(&statement),
+            Some(ExactChargedStatement {
+                policy_id: 7,
+                scope_hash: statement.scope_hash,
+                charged_bytes: 100,
+            })
+        );
 
         statement.decision = AdmissionDecision::would_reject(7, 100);
-        assert!(!should_reconcile_budget(&statement));
+        assert_eq!(ExactChargedStatement::from_active(&statement), None);
 
         statement.decision = AdmissionDecision::allowed(Some(7), 0, ReasonCode::ObserveMode);
-        assert!(!should_reconcile_budget(&statement));
+        assert_eq!(ExactChargedStatement::from_active(&statement), None);
 
         statement.decision = AdmissionDecision::allowed(Some(7), 100, ReasonCode::BudgetAvailable);
         statement.measurement_kind = WalMeasurementKind::ApproximateInsertLsn;
-        assert!(!should_reconcile_budget(&statement));
+        assert_eq!(ExactChargedStatement::from_active(&statement), None);
     }
 
     #[test]
@@ -252,47 +290,40 @@ mod tests {
             100,
             ReasonCode::BudgetAvailable,
         ));
-        assert!(should_record_profile_observation(&statement));
+        assert_eq!(
+            ExactProfileObservation::from_active(&statement),
+            Some(ExactProfileObservation {
+                scope_hash: statement.scope_hash,
+                query_id: 42,
+            })
+        );
 
         statement.measurement_kind = WalMeasurementKind::ApproximateInsertLsn;
-        assert!(!should_record_profile_observation(&statement));
+        assert_eq!(ExactProfileObservation::from_active(&statement), None);
 
         statement.measurement_kind = WalMeasurementKind::ExactBackend;
         statement.query_id = None;
-        assert!(!should_record_profile_observation(&statement));
+        assert_eq!(ExactProfileObservation::from_active(&statement), None);
     }
 
     #[test]
     fn budget_reconciliation_refunds_or_records_debt_only_for_exact_charges() {
-        let mut statement = test_statement(AdmissionDecision::allowed(
-            Some(7),
-            100,
-            ReasonCode::BudgetAvailable,
-        ));
+        let charge = ExactChargedStatement {
+            policy_id: 7,
+            scope_hash: 99,
+            charged_bytes: 100,
+        };
 
         assert_eq!(
-            budget_reconciliation(&statement, 60),
+            budget_reconciliation(charge, 60),
             BudgetReconciliation::Refund(40)
         );
         assert_eq!(
-            budget_reconciliation(&statement, 140),
+            budget_reconciliation(charge, 140),
             BudgetReconciliation::Debt(40)
         );
         assert_eq!(
-            budget_reconciliation(&statement, 100),
-            BudgetReconciliation::None
-        );
-
-        statement.measurement_kind = WalMeasurementKind::ApproximateInsertLsn;
-        assert_eq!(
-            budget_reconciliation(&statement, 140),
-            BudgetReconciliation::None
-        );
-
-        statement.measurement_kind = WalMeasurementKind::ExactBackend;
-        statement.decision = AdmissionDecision::allowed(Some(7), 0, ReasonCode::ObserveMode);
-        assert_eq!(
-            budget_reconciliation(&statement, 140),
+            budget_reconciliation(charge, 100),
             BudgetReconciliation::None
         );
     }

@@ -1,4 +1,5 @@
 create extension if not exists pg_wal_budget;
+set compute_query_id = on;
 
 truncate table pwb.policy restart identity cascade;
 select pwb.reset_stats();
