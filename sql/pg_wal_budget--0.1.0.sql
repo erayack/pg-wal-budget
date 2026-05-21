@@ -24,6 +24,27 @@ create table pwb.policy (
 create index policy_match_idx
   on pwb.policy (enabled, scope_kind, scope_value, priority desc, policy_id);
 
+create table pwb.query_profile (
+  scope_hash numeric(20, 0),
+  query_id numeric(20, 0) not null,
+  calls numeric(20, 0) not null,
+  ewma_wal_bytes numeric(20, 0) not null,
+  max_wal_bytes numeric(20, 0) not null,
+  last_seen_epoch_ms numeric(20, 0) not null,
+  updated_at timestamptz not null default now(),
+  constraint query_profile_key unique nulls not distinct (query_id, scope_hash),
+  constraint query_profile_scope_hash_nonnegative_check
+    check (scope_hash is null or scope_hash >= 0),
+  constraint query_profile_calls_positive_check
+    check (calls > 0),
+  constraint query_profile_ewma_nonnegative_check
+    check (ewma_wal_bytes >= 0),
+  constraint query_profile_max_nonnegative_check
+    check (max_wal_bytes >= 0),
+  constraint query_profile_last_seen_nonnegative_check
+    check (last_seen_epoch_ms >= 0)
+);
+
 create function pwb.touch_policy_updated_at()
 returns trigger
 language plpgsql
@@ -168,10 +189,19 @@ returns void
 language c
 as 'MODULE_PATHNAME', 'pwb_reset_stats_wrapper';
 
+-- Durable profile maintenance uses SECURITY DEFINER for table access; the C wrappers still
+-- enforce pwb_admin membership before mutating pwb.query_profile.
 create function pwb.reset_profiles()
 returns void
 language c
+security definer
 as 'MODULE_PATHNAME', 'pwb_reset_profiles_wrapper';
+
+create function pwb.flush_profiles()
+returns void
+language c
+security definer
+as 'MODULE_PATHNAME', 'pwb_flush_profiles_wrapper';
 
 create view pwb.active_policy_precedence as
 select *
@@ -211,6 +241,9 @@ grant usage on schema pwb to pwb_admin, pwb_monitor, pwb_tenant_setter;
 revoke all on table pwb.policy from public;
 grant select on table pwb.policy to pwb_admin, pwb_monitor;
 
+revoke all on table pwb.query_profile from public;
+grant select on table pwb.query_profile to pwb_admin, pwb_monitor;
+
 revoke all on pwb.active_policy_precedence from public;
 grant select on pwb.active_policy_precedence to pwb_admin, pwb_monitor;
 
@@ -239,8 +272,10 @@ grant execute on function pwb.recent_decisions(integer) to pwb_admin, pwb_monito
 
 revoke all on function pwb.reset_stats() from public;
 revoke all on function pwb.reset_profiles() from public;
+revoke all on function pwb.flush_profiles() from public;
 grant execute on function pwb.reset_stats() to pwb_admin;
 grant execute on function pwb.reset_profiles() to pwb_admin;
+grant execute on function pwb.flush_profiles() to pwb_admin;
 
 grant execute on function pwb.version() to public;
 grant execute on function pwb.preload_status() to public;

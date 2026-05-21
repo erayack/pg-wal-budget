@@ -4,6 +4,8 @@ use pgrx::{PgLogLevel, PgSqlErrorCode, ereport};
 
 use crate::errors::{PwbError, PwbResult};
 use crate::privileges::{self, ADMIN_ROLE};
+use crate::profile;
+use crate::profile_store;
 use crate::shmem::{
     self, BudgetBucketSnapshot, PwbCounters, QueryProfileSnapshot, RecentDecisionRecord,
 };
@@ -152,6 +154,11 @@ fn pwb_reset_profiles() {
     reset_profiles_impl().unwrap_or_else(raise_stats_error);
 }
 
+#[pg_extern]
+fn pwb_flush_profiles() {
+    flush_profiles_impl().unwrap_or_else(raise_stats_error);
+}
+
 fn reset_stats_impl() -> PwbResult<()> {
     require_admin("reset pg_wal_budget stats")?;
     shmem::reset_stats()
@@ -159,7 +166,13 @@ fn reset_stats_impl() -> PwbResult<()> {
 
 fn reset_profiles_impl() -> PwbResult<()> {
     require_admin("reset pg_wal_budget query profiles")?;
+    profile_store::delete_profiles()?;
     shmem::reset_profiles()
+}
+
+fn flush_profiles_impl() -> PwbResult<()> {
+    require_admin("flush pg_wal_budget query profiles")?;
+    profile::flush_profiles()
 }
 
 const fn counters_row(counters: PwbCounters) -> CountersRow {

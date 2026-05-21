@@ -1,11 +1,16 @@
 #![allow(dead_code)]
 
 use crate::errors::PwbResult;
+use crate::guc;
+use crate::profile_store;
 use crate::shmem;
+use crate::time;
 use crate::types::{EpochMillis, QueryId, QueryWalProfile, ScopeHash, WalBytes};
 
 pub(crate) const EWMA_ALPHA_NUMERATOR: u64 = 1;
 pub(crate) const EWMA_ALPHA_DENOMINATOR: u64 = 2;
+const PROFILE_PERSIST_INTERVAL_MS: EpochMillis = 60_000;
+const PROFILE_RESTORE_STALE_MS: EpochMillis = 60_000;
 // Invariant: these compile-time weights satisfy ProfileEwmaWeights::new validation.
 const EWMA_WEIGHTS: shmem::ProfileEwmaWeights = shmem::ProfileEwmaWeights {
     numerator: EWMA_ALPHA_NUMERATOR,
@@ -20,7 +25,10 @@ pub(crate) fn lookup_prediction_profile(
         return Ok(None);
     };
 
-    shmem::lookup_scoped_or_global_query_profile(scope_hash, query_id)
+    ensure_profiles_loaded()?;
+    let profile = shmem::lookup_scoped_or_global_query_profile(scope_hash, query_id)?;
+    let _ = maybe_persist_profiles(time::current_epoch_ms());
+    Ok(profile)
 }
 
 pub(crate) fn record_observation(
@@ -42,6 +50,7 @@ pub(crate) fn record_query_observation(
     actual_wal_bytes: WalBytes,
     now_epoch_ms: EpochMillis,
 ) -> PwbResult<()> {
+    ensure_profiles_loaded()?;
     shmem::upsert_scoped_and_global_query_profiles(
         scope_hash,
         query_id,
@@ -49,6 +58,43 @@ pub(crate) fn record_query_observation(
         now_epoch_ms,
         EWMA_WEIGHTS,
     )
+}
+
+pub(crate) fn flush_profiles() -> PwbResult<()> {
+    ensure_profiles_loaded()?;
+    let now_epoch_ms = time::current_epoch_ms();
+    let profiles = shmem::snapshot_profiles_for_persist(now_epoch_ms)?;
+    profile_store::persist_profiles(&profiles)?;
+    shmem::complete_profile_persist(true)
+}
+
+fn ensure_profiles_loaded() -> PwbResult<()> {
+    let now_epoch_ms = time::current_epoch_ms();
+    if !shmem::begin_profile_restore(now_epoch_ms, PROFILE_RESTORE_STALE_MS)? {
+        return Ok(());
+    }
+
+    let restore_result = (|| {
+        let profiles = profile_store::load_profiles(guc::profile_cache_capacity())?;
+        shmem::finish_profile_restore(&profiles)
+    })();
+
+    if restore_result.is_err() {
+        let _ = shmem::mark_profile_restore_failed();
+    }
+
+    restore_result
+}
+
+fn maybe_persist_profiles(now_epoch_ms: EpochMillis) -> PwbResult<()> {
+    let Some(profiles) = shmem::reserve_profile_persist(now_epoch_ms, PROFILE_PERSIST_INTERVAL_MS)?
+    else {
+        return Ok(());
+    };
+
+    let persist_result = profile_store::persist_profiles(&profiles);
+    let _ = shmem::complete_profile_persist(persist_result.is_ok());
+    persist_result
 }
 
 #[cfg(test)]

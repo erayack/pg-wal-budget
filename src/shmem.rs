@@ -16,8 +16,12 @@ use crate::types::{
 const SHMEM_NAME: &[u8] = b"pg_wal_budget shared state\0";
 const LWLOCK_TRANCHE_NAME: &[u8] = b"pg_wal_budget\0";
 const MAGIC: u32 = 0x5057_4201;
-const LAYOUT_VERSION: u32 = 2;
+const LAYOUT_VERSION: u32 = 3;
 const UNSET_ENUM: u8 = 0;
+const PROFILE_RESTORE_NOT_ATTEMPTED: u8 = 0;
+const PROFILE_RESTORE_IN_PROGRESS: u8 = 1;
+const PROFILE_RESTORE_LOADED: u8 = 2;
+const PROFILE_RESTORE_FAILED: u8 = 3;
 
 static mut SHARED_STATE: *mut PwbSharedState = ptr::null_mut();
 static mut SHARED_LOCK: *mut pg_sys::LWLock = ptr::null_mut();
@@ -37,6 +41,11 @@ pub(crate) struct PwbSharedState {
     recent_decision_count: u32,
     profiles_len: u32,
     budget_buckets_len: u32,
+    profile_restore_state: u8,
+    _profile_restore_padding: [u8; 7],
+    profile_restore_started_epoch_ms: EpochMillis,
+    last_profile_persist_epoch_ms: EpochMillis,
+    profile_dirty_count: u64,
     counters: PwbCounters,
 }
 
@@ -410,6 +419,10 @@ pub(crate) fn reset_recent_decisions() -> PwbResult<()> {
 pub(crate) fn reset_profiles() -> PwbResult<()> {
     with_locked_state(|state, _recent_decisions, profiles| {
         state.profiles_len = 0;
+        state.profile_restore_state = PROFILE_RESTORE_LOADED;
+        state.profile_restore_started_epoch_ms = 0;
+        state.last_profile_persist_epoch_ms = 0;
+        state.profile_dirty_count = 0;
         profiles.fill(PwbProfileEntry::default());
         Ok(())
     })
@@ -417,6 +430,85 @@ pub(crate) fn reset_profiles() -> PwbResult<()> {
 
 pub(crate) fn snapshot_query_profiles() -> PwbResult<Vec<QueryProfileSnapshot>> {
     with_locked_state(|_state, _recent_decisions, profiles| snapshot_profiles_from_slice(profiles))
+}
+
+pub(crate) fn begin_profile_restore(
+    now_epoch_ms: EpochMillis,
+    stale_after_ms: EpochMillis,
+) -> PwbResult<bool> {
+    with_locked_state(|state, _recent_decisions, _profiles| {
+        let stale_restore = state.profile_restore_state == PROFILE_RESTORE_IN_PROGRESS
+            && now_epoch_ms.saturating_sub(state.profile_restore_started_epoch_ms)
+                >= stale_after_ms;
+
+        if matches!(
+            state.profile_restore_state,
+            PROFILE_RESTORE_NOT_ATTEMPTED | PROFILE_RESTORE_FAILED
+        ) || stale_restore
+        {
+            state.profile_restore_state = PROFILE_RESTORE_IN_PROGRESS;
+            state.profile_restore_started_epoch_ms = now_epoch_ms;
+            return Ok(true);
+        }
+
+        Ok(false)
+    })
+}
+
+pub(crate) fn finish_profile_restore(restored: &[QueryProfileSnapshot]) -> PwbResult<()> {
+    with_locked_state(|state, _recent_decisions, profiles| {
+        for snapshot in restored {
+            upsert_restored_query_profile_locked(state, profiles, *snapshot)?;
+        }
+        state.profile_restore_state = PROFILE_RESTORE_LOADED;
+        state.profile_restore_started_epoch_ms = 0;
+        Ok(())
+    })
+}
+
+pub(crate) fn mark_profile_restore_failed() -> PwbResult<()> {
+    with_locked_state(|state, _recent_decisions, _profiles| {
+        if state.profile_restore_state == PROFILE_RESTORE_IN_PROGRESS {
+            state.profile_restore_state = PROFILE_RESTORE_FAILED;
+            state.profile_restore_started_epoch_ms = 0;
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn reserve_profile_persist(
+    now_epoch_ms: EpochMillis,
+    interval_ms: EpochMillis,
+) -> PwbResult<Option<Vec<QueryProfileSnapshot>>> {
+    with_locked_state(|state, _recent_decisions, profiles| {
+        if state.profile_dirty_count == 0
+            || now_epoch_ms.saturating_sub(state.last_profile_persist_epoch_ms) < interval_ms
+        {
+            return Ok(None);
+        }
+
+        let snapshots = snapshot_profiles_from_slice(profiles)?;
+        state.last_profile_persist_epoch_ms = now_epoch_ms;
+        Ok(Some(snapshots))
+    })
+}
+
+pub(crate) fn snapshot_profiles_for_persist(
+    now_epoch_ms: EpochMillis,
+) -> PwbResult<Vec<QueryProfileSnapshot>> {
+    with_locked_state(|state, _recent_decisions, profiles| {
+        state.last_profile_persist_epoch_ms = now_epoch_ms;
+        snapshot_profiles_from_slice(profiles)
+    })
+}
+
+pub(crate) fn complete_profile_persist(success: bool) -> PwbResult<()> {
+    with_locked_state(|state, _recent_decisions, _profiles| {
+        if success {
+            state.profile_dirty_count = 0;
+        }
+        Ok(())
+    })
 }
 
 pub(crate) fn lookup_query_profile(
@@ -485,7 +577,9 @@ pub(crate) fn upsert_scoped_and_global_query_profiles(
             actual_wal_bytes,
             now_epoch_ms,
             ewma_weights,
-        )
+        )?;
+        state.profile_dirty_count = state.profile_dirty_count.saturating_add(1);
+        Ok(())
     })
 }
 
@@ -554,6 +648,51 @@ fn upsert_query_profile_locked(
     };
 
     profiles[slot] = PwbProfileEntry::encode(scope_hash, query_id, profile);
+    Ok(())
+}
+
+fn upsert_restored_query_profile_locked(
+    state: &mut PwbSharedState,
+    profiles: &mut [PwbProfileEntry],
+    snapshot: QueryProfileSnapshot,
+) -> PwbResult<()> {
+    if profiles.is_empty() {
+        return Err(profile_cache_capacity_exhausted());
+    }
+
+    if let Some(slot) = find_profile_slot(profiles, snapshot.scope_hash, snapshot.query_id) {
+        let existing: QueryWalProfile = profiles[slot].profile.into();
+        if existing.last_seen_epoch_ms <= snapshot.profile.last_seen_epoch_ms {
+            profiles[slot] = PwbProfileEntry::encode(
+                snapshot.scope_hash,
+                snapshot.query_id,
+                snapshot.profile.into(),
+            );
+        }
+        return Ok(());
+    }
+
+    let slot = if let Some(slot) = find_empty_profile_slot(profiles) {
+        state.profiles_len = state
+            .profiles_len
+            .saturating_add(1)
+            .min(state.profile_cache_capacity);
+        slot
+    } else {
+        let eviction_slot =
+            find_profile_eviction_slot(profiles).ok_or_else(profile_cache_capacity_exhausted)?;
+        let existing: QueryWalProfile = profiles[eviction_slot].profile.into();
+        if existing.last_seen_epoch_ms > snapshot.profile.last_seen_epoch_ms {
+            return Ok(());
+        }
+        eviction_slot
+    };
+
+    profiles[slot] = PwbProfileEntry::encode(
+        snapshot.scope_hash,
+        snapshot.query_id,
+        snapshot.profile.into(),
+    );
     Ok(())
 }
 
@@ -651,6 +790,11 @@ unsafe fn initialize_state(state: *mut PwbSharedState, layout: SharedLayout) {
                 recent_decision_count: 0,
                 profiles_len: 0,
                 budget_buckets_len: 0,
+                profile_restore_state: PROFILE_RESTORE_NOT_ATTEMPTED,
+                _profile_restore_padding: [0; 7],
+                profile_restore_started_epoch_ms: 0,
+                last_profile_persist_epoch_ms: 0,
+                profile_dirty_count: 0,
                 counters: PwbCounters::default(),
             },
         );
@@ -1247,6 +1391,11 @@ mod tests {
             recent_decision_count: 0,
             profiles_len: 0,
             budget_buckets_len: 0,
+            profile_restore_state: PROFILE_RESTORE_NOT_ATTEMPTED,
+            _profile_restore_padding: [0; 7],
+            profile_restore_started_epoch_ms: 0,
+            last_profile_persist_epoch_ms: 0,
+            profile_dirty_count: 0,
             counters: PwbCounters::default(),
         }
     }

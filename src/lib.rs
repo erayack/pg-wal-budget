@@ -11,6 +11,7 @@ pub(crate) mod policy;
 pub(crate) mod predict;
 pub(crate) mod privileges;
 pub(crate) mod profile;
+pub(crate) mod profile_store;
 pub(crate) mod reconcile;
 pub(crate) mod scope;
 pub(crate) mod shmem;
