@@ -1,6 +1,3 @@
-#![allow(dead_code)]
-
-use core::mem::{align_of, size_of};
 use core::ptr;
 use std::slice;
 
@@ -13,10 +10,23 @@ use crate::types::{
     ScopeHash, ScopeKind, StatementClass, WalBytes,
 };
 
+mod budget_buckets;
+mod counters;
+mod layout;
+mod recent_decisions;
+
+pub(crate) use budget_buckets::{
+    snapshot_budget_buckets, with_budget_bucket, with_existing_budget_bucket,
+};
+pub(crate) use counters::{add_counters, snapshot_counters};
+use layout::{SharedLayout, capacity_to_u32, compute_layout};
+pub(crate) use recent_decisions::{record_recent_decision, snapshot_recent_decisions};
+
 const SHMEM_NAME: &[u8] = b"pg_wal_budget shared state\0";
 const LWLOCK_TRANCHE_NAME: &[u8] = b"pg_wal_budget\0";
 const MAGIC: u32 = 0x5057_4201;
 const LAYOUT_VERSION: u32 = 3;
+#[cfg(test)]
 const UNSET_ENUM: u8 = 0;
 const PROFILE_RESTORE_NOT_ATTEMPTED: u8 = 0;
 const PROFILE_RESTORE_IN_PROGRESS: u8 = 1;
@@ -231,31 +241,6 @@ pub(crate) struct RecentDecisionRecord {
     pub(crate) reason_code: ReasonCode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SharedLayout {
-    total_bytes: usize,
-    recent_decisions_offset: usize,
-    profiles_offset: usize,
-    budget_buckets_offset: usize,
-    recent_decision_capacity: usize,
-    profile_cache_capacity: usize,
-    budget_bucket_capacity: usize,
-}
-
-impl SharedLayout {
-    const fn empty() -> Self {
-        Self {
-            total_bytes: 0,
-            recent_decisions_offset: 0,
-            profiles_offset: 0,
-            budget_buckets_offset: 0,
-            recent_decision_capacity: 0,
-            profile_cache_capacity: 0,
-            budget_bucket_capacity: 0,
-        }
-    }
-}
-
 pub(crate) fn request_shared_memory() {
     // SAFETY: _PG_init runs during extension preload. Shared memory sizing must happen from
     // PostgreSQL's shmem_request_hook; startup initialization remains in shmem_startup_hook.
@@ -306,88 +291,9 @@ pub(crate) fn is_available() -> bool {
     }
 }
 
-pub(crate) fn add_counters(delta: CounterDelta) -> PwbResult<()> {
-    with_locked_state(|state, _recent_decisions, _profiles| {
-        state.counters.saturating_add_delta(delta);
-        Ok(())
-    })
-}
-
-pub(crate) fn snapshot_counters() -> PwbResult<PwbCounters> {
-    with_locked_state(|state, _recent_decisions, _profiles| Ok(state.counters))
-}
-
-pub(crate) fn reset_counters() -> PwbResult<()> {
-    with_locked_state(|state, _recent_decisions, _profiles| {
-        state.counters = PwbCounters::default();
-        Ok(())
-    })
-}
-
 pub(crate) fn reset_stats() -> PwbResult<()> {
     with_locked_state(|state, recent_decisions, _profiles| {
         state.counters = PwbCounters::default();
-        state.recent_decision_head = 0;
-        state.recent_decision_count = 0;
-        recent_decisions.fill(PwbRecentDecision::default());
-        Ok(())
-    })
-}
-
-pub(crate) fn record_recent_decision(record: RecentDecisionRecord) -> PwbResult<()> {
-    with_locked_state(|state, recent_decisions, _profiles| {
-        let capacity = recent_decision_capacity(state);
-        if capacity == 0 {
-            return Ok(());
-        }
-
-        if state.recent_decision_head == u64::MAX {
-            state.recent_decision_head = 0;
-            state.recent_decision_count = 0;
-            recent_decisions.fill(PwbRecentDecision::default());
-        }
-
-        let slot = ring_slot(state.recent_decision_head, capacity);
-        recent_decisions[slot] = PwbRecentDecision::encode(record);
-        state.recent_decision_head = state.recent_decision_head.saturating_add(1);
-        state.recent_decision_count = state
-            .recent_decision_count
-            .saturating_add(1)
-            .min(state.recent_decision_capacity);
-        Ok(())
-    })
-}
-
-pub(crate) fn snapshot_recent_decisions(limit: usize) -> PwbResult<Vec<RecentDecisionRecord>> {
-    with_locked_state(|state, recent_decisions, _profiles| {
-        let capacity = recent_decision_capacity(state);
-        if capacity == 0 || limit == 0 {
-            return Ok(Vec::new());
-        }
-
-        let count = recent_decision_count(state);
-        let snapshot_count = limit.min(count).min(capacity);
-        let mut records = Vec::with_capacity(snapshot_count);
-        let mut sequence =
-            state
-                .recent_decision_head
-                .checked_sub(1)
-                .ok_or_else(|| PwbError::Internal {
-                    message: "recent decision ring head underflow".to_string(),
-                })?;
-
-        for _ in 0..snapshot_count {
-            let slot = ring_slot(sequence, capacity);
-            records.push(recent_decisions[slot].decode()?);
-            sequence = sequence.saturating_sub(1);
-        }
-
-        Ok(records)
-    })
-}
-
-pub(crate) fn reset_recent_decisions() -> PwbResult<()> {
-    with_locked_state(|state, recent_decisions, _profiles| {
         state.recent_decision_head = 0;
         state.recent_decision_count = 0;
         recent_decisions.fill(PwbRecentDecision::default());
@@ -490,19 +396,6 @@ pub(crate) fn complete_profile_persist(success: bool) -> PwbResult<()> {
     })
 }
 
-pub(crate) fn lookup_query_profile(
-    scope_hash: Option<ScopeHash>,
-    query_id: QueryId,
-) -> PwbResult<Option<QueryWalProfile>> {
-    with_locked_state(|_state, _recent_decisions, profiles| {
-        let Some(slot) = find_profile_slot(profiles, scope_hash, query_id) else {
-            return Ok(None);
-        };
-
-        Ok(Some(profiles[slot].profile.into()))
-    })
-}
-
 pub(crate) fn lookup_scoped_or_global_query_profile(
     scope_hash: ScopeHash,
     query_id: QueryId,
@@ -517,26 +410,6 @@ pub(crate) fn lookup_scoped_or_global_query_profile(
         };
 
         Ok(Some(profiles[slot].profile.into()))
-    })
-}
-
-pub(crate) fn upsert_query_profile(
-    scope_hash: Option<ScopeHash>,
-    query_id: QueryId,
-    actual_wal_bytes: WalBytes,
-    now_epoch_ms: EpochMillis,
-    ewma_weights: ProfileEwmaWeights,
-) -> PwbResult<()> {
-    with_locked_state(|state, _recent_decisions, profiles| {
-        upsert_query_profile_locked(
-            state,
-            profiles,
-            scope_hash,
-            query_id,
-            actual_wal_bytes,
-            now_epoch_ms,
-            ewma_weights,
-        )
     })
 }
 
@@ -675,38 +548,6 @@ fn upsert_restored_query_profile_locked(
     Ok(())
 }
 
-pub(crate) fn snapshot_budget_buckets() -> PwbResult<Vec<BudgetBucketSnapshot>> {
-    with_locked_bucket_state(|_state, buckets| snapshot_budget_buckets_from_slice(buckets))
-}
-
-pub(crate) fn with_budget_bucket<R>(
-    policy_id: PolicyId,
-    scope_hash: ScopeHash,
-    initializer: impl FnOnce() -> BudgetBucketState,
-    callback: impl FnOnce(&mut BudgetBucketState) -> PwbResult<R>,
-) -> PwbResult<R> {
-    with_locked_bucket_state(|state, buckets| {
-        apply_budget_bucket(state, buckets, policy_id, scope_hash, initializer, callback)
-    })
-}
-
-pub(crate) fn with_existing_budget_bucket<R>(
-    policy_id: PolicyId,
-    scope_hash: ScopeHash,
-    callback: impl FnOnce(&mut BudgetBucketState) -> PwbResult<R>,
-) -> PwbResult<Option<R>> {
-    with_locked_bucket_state(|_state, buckets| {
-        let Some(slot) = find_budget_bucket_slot(buckets, policy_id, scope_hash) else {
-            return Ok(None);
-        };
-
-        let mut bucket = buckets[slot].state();
-        let result = callback(&mut bucket)?;
-        buckets[slot] = PwbBudgetBucket::encode(bucket);
-        Ok(Some(result))
-    })
-}
-
 unsafe extern "C-unwind" fn shmem_startup() {
     // SAFETY: PostgreSQL invokes this hook while initializing shared memory. Chaining the previous
     // hook preserves any hook installed before this extension.
@@ -832,37 +673,6 @@ fn with_locked_bucket_state<R>(
     callback(state, budget_buckets)
 }
 
-fn apply_budget_bucket<R>(
-    state: &mut PwbSharedState,
-    buckets: &mut [PwbBudgetBucket],
-    policy_id: PolicyId,
-    scope_hash: ScopeHash,
-    initializer: impl FnOnce() -> BudgetBucketState,
-    callback: impl FnOnce(&mut BudgetBucketState) -> PwbResult<R>,
-) -> PwbResult<R> {
-    if buckets.is_empty() {
-        return Err(budget_bucket_capacity_exhausted());
-    }
-
-    if let Some(slot) = find_budget_bucket_slot(buckets, policy_id, scope_hash) {
-        let mut bucket = buckets[slot].state();
-        let result = callback(&mut bucket)?;
-        buckets[slot] = PwbBudgetBucket::encode(bucket);
-        return Ok(result);
-    }
-
-    let slot =
-        find_empty_budget_bucket_slot(buckets).ok_or_else(budget_bucket_capacity_exhausted)?;
-    let mut bucket = initializer();
-    let result = callback(&mut bucket)?;
-    buckets[slot] = PwbBudgetBucket::encode(bucket);
-    state.budget_buckets_len = state
-        .budget_buckets_len
-        .saturating_add(1)
-        .min(state.budget_bucket_capacity);
-    Ok(result)
-}
-
 fn snapshot_profiles_from_slice(
     profiles: &[PwbProfileEntry],
 ) -> PwbResult<Vec<QueryProfileSnapshot>> {
@@ -874,27 +684,6 @@ fn snapshot_profiles_from_slice(
             scope_hash: decoded.scope_hash,
             query_id: decoded.query_id,
             profile: decoded.profile.into(),
-        });
-    }
-
-    Ok(snapshots)
-}
-
-fn snapshot_budget_buckets_from_slice(
-    buckets: &[PwbBudgetBucket],
-) -> PwbResult<Vec<BudgetBucketSnapshot>> {
-    let mut snapshots = Vec::new();
-
-    for bucket in buckets.iter().filter(|bucket| bucket.occupied == 1) {
-        let decoded = bucket.decode()?;
-        snapshots.push(BudgetBucketSnapshot {
-            policy_id: decoded.policy_id,
-            scope_hash: decoded.scope_hash,
-            available_bytes: decoded.available_bytes,
-            max_burst_bytes: decoded.max_burst_bytes,
-            rate_bytes_per_sec: decoded.rate_bytes_per_sec,
-            last_refill_epoch_ms: decoded.last_refill_epoch_ms,
-            debt_bytes: decoded.debt_bytes,
         });
     }
 
@@ -967,65 +756,6 @@ const unsafe fn slice_from_region_mut<T>(
     unsafe { slice::from_raw_parts_mut(base.add(offset).cast::<T>(), len) }
 }
 
-fn compute_layout(
-    recent_decision_capacity: usize,
-    profile_cache_capacity: usize,
-) -> PwbResult<SharedLayout> {
-    let mut offset = size_of::<PwbSharedState>();
-
-    offset = align_up(offset, align_of::<PwbRecentDecision>())?;
-    let recent_decisions_offset = offset;
-    offset = checked_add(
-        offset,
-        checked_mul(recent_decision_capacity, size_of::<PwbRecentDecision>())?,
-    )?;
-
-    offset = align_up(offset, align_of::<PwbProfileEntry>())?;
-    let profiles_offset = offset;
-    offset = checked_add(
-        offset,
-        checked_mul(profile_cache_capacity, size_of::<PwbProfileEntry>())?,
-    )?;
-
-    offset = align_up(offset, align_of::<PwbBudgetBucket>())?;
-    let budget_buckets_offset = offset;
-    // Until pg_wal_budget has a dedicated bucket-capacity GUC, bucket capacity tracks the profile
-    // cache capacity so shared-memory sizing remains bounded by existing postmaster settings.
-    let budget_bucket_capacity = profile_cache_capacity;
-    offset = checked_add(
-        offset,
-        checked_mul(budget_bucket_capacity, size_of::<PwbBudgetBucket>())?,
-    )?;
-
-    Ok(SharedLayout {
-        total_bytes: offset,
-        recent_decisions_offset,
-        profiles_offset,
-        budget_buckets_offset,
-        recent_decision_capacity,
-        profile_cache_capacity,
-        budget_bucket_capacity,
-    })
-}
-
-fn align_up(value: usize, alignment: usize) -> PwbResult<usize> {
-    debug_assert!(alignment.is_power_of_two());
-    let mask = alignment - 1;
-    checked_add(value, mask).map(|adjusted| adjusted & !mask)
-}
-
-fn checked_add(left: usize, right: usize) -> PwbResult<usize> {
-    left.checked_add(right).ok_or_else(|| PwbError::Internal {
-        message: "shared memory size calculation overflowed".to_string(),
-    })
-}
-
-fn checked_mul(left: usize, right: usize) -> PwbResult<usize> {
-    left.checked_mul(right).ok_or_else(|| PwbError::Internal {
-        message: "shared memory size calculation overflowed".to_string(),
-    })
-}
-
 #[allow(
     clippy::cast_possible_truncation,
     reason = "modulo result is strictly less than the usize capacity"
@@ -1043,19 +773,6 @@ const fn recent_decision_capacity(state: &PwbSharedState) -> usize {
 
 const fn recent_decision_count(state: &PwbSharedState) -> usize {
     state.recent_decision_count as usize
-}
-
-const fn budget_bucket_capacity(state: &PwbSharedState) -> usize {
-    state.budget_bucket_capacity as usize
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "capacity GUCs are bounded to 1,000,000 before layout construction"
-)]
-const fn capacity_to_u32(capacity: usize) -> u32 {
-    // Shared memory layout capacities are derived from postmaster GUCs with a u32-safe upper bound.
-    capacity as u32
 }
 
 impl PwbRecentDecision {
@@ -1205,20 +922,6 @@ fn find_profile_eviction_slot(profiles: &[PwbProfileEntry]) -> Option<usize> {
         .map(|(slot, _profile)| slot)
 }
 
-fn find_budget_bucket_slot(
-    buckets: &[PwbBudgetBucket],
-    policy_id: PolicyId,
-    scope_hash: ScopeHash,
-) -> Option<usize> {
-    buckets.iter().position(|bucket| {
-        bucket.occupied == 1 && bucket.policy_id == policy_id && bucket.scope_hash == scope_hash
-    })
-}
-
-fn find_empty_budget_bucket_slot(buckets: &[PwbBudgetBucket]) -> Option<usize> {
-    buckets.iter().position(|bucket| bucket.occupied == 0)
-}
-
 fn decode_optional<T: Copy>(flag: u8, value: T) -> PwbResult<Option<T>> {
     match flag {
         0 => Ok(None),
@@ -1357,6 +1060,7 @@ fn raise_startup_error(error: &PwbError) -> ! {
 
 #[cfg(test)]
 mod tests {
+    use super::budget_buckets::{apply_budget_bucket, snapshot_budget_buckets_from_slice};
     use super::*;
 
     fn test_state(budget_bucket_capacity: u32) -> PwbSharedState {

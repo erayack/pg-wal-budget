@@ -1,0 +1,98 @@
+use core::mem::{align_of, size_of};
+
+use crate::errors::{PwbError, PwbResult};
+
+use super::{PwbBudgetBucket, PwbProfileEntry, PwbRecentDecision, PwbSharedState};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SharedLayout {
+    pub(super) total_bytes: usize,
+    pub(super) recent_decisions_offset: usize,
+    pub(super) profiles_offset: usize,
+    pub(super) budget_buckets_offset: usize,
+    pub(super) recent_decision_capacity: usize,
+    pub(super) profile_cache_capacity: usize,
+    pub(super) budget_bucket_capacity: usize,
+}
+
+impl SharedLayout {
+    pub(super) const fn empty() -> Self {
+        Self {
+            total_bytes: 0,
+            recent_decisions_offset: 0,
+            profiles_offset: 0,
+            budget_buckets_offset: 0,
+            recent_decision_capacity: 0,
+            profile_cache_capacity: 0,
+            budget_bucket_capacity: 0,
+        }
+    }
+}
+
+pub(super) fn compute_layout(
+    recent_decision_capacity: usize,
+    profile_cache_capacity: usize,
+) -> PwbResult<SharedLayout> {
+    let mut offset = size_of::<PwbSharedState>();
+
+    offset = align_up(offset, align_of::<PwbRecentDecision>())?;
+    let recent_decisions_offset = offset;
+    offset = checked_add(
+        offset,
+        checked_mul(recent_decision_capacity, size_of::<PwbRecentDecision>())?,
+    )?;
+
+    offset = align_up(offset, align_of::<PwbProfileEntry>())?;
+    let profiles_offset = offset;
+    offset = checked_add(
+        offset,
+        checked_mul(profile_cache_capacity, size_of::<PwbProfileEntry>())?,
+    )?;
+
+    offset = align_up(offset, align_of::<PwbBudgetBucket>())?;
+    let budget_buckets_offset = offset;
+    // Until pg_wal_budget has a dedicated bucket-capacity GUC, bucket capacity tracks the profile
+    // cache capacity so shared-memory sizing remains bounded by existing postmaster settings.
+    let budget_bucket_capacity = profile_cache_capacity;
+    offset = checked_add(
+        offset,
+        checked_mul(budget_bucket_capacity, size_of::<PwbBudgetBucket>())?,
+    )?;
+
+    Ok(SharedLayout {
+        total_bytes: offset,
+        recent_decisions_offset,
+        profiles_offset,
+        budget_buckets_offset,
+        recent_decision_capacity,
+        profile_cache_capacity,
+        budget_bucket_capacity,
+    })
+}
+
+fn align_up(value: usize, alignment: usize) -> PwbResult<usize> {
+    debug_assert!(alignment.is_power_of_two());
+    let mask = alignment - 1;
+    checked_add(value, mask).map(|adjusted| adjusted & !mask)
+}
+
+fn checked_add(left: usize, right: usize) -> PwbResult<usize> {
+    left.checked_add(right).ok_or_else(|| PwbError::Internal {
+        message: "shared memory size calculation overflowed".to_string(),
+    })
+}
+
+fn checked_mul(left: usize, right: usize) -> PwbResult<usize> {
+    left.checked_mul(right).ok_or_else(|| PwbError::Internal {
+        message: "shared memory size calculation overflowed".to_string(),
+    })
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "capacity GUCs are bounded to 1,000,000 before layout construction"
+)]
+pub(super) const fn capacity_to_u32(capacity: usize) -> u32 {
+    // Shared memory layout capacities are derived from postmaster GUCs with a u32-safe upper bound.
+    capacity as u32
+}
