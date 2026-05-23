@@ -1,8 +1,7 @@
 use pgrx::iter::TableIterator;
 use pgrx::prelude::*;
-use pgrx::{PgLogLevel, PgSqlErrorCode, ereport};
 
-use crate::errors::{PwbError, PwbResult};
+use crate::errors::{self, PwbError, PwbResult};
 use crate::privileges::{self, ADMIN_ROLE};
 use crate::profile;
 use crate::profile_store;
@@ -78,7 +77,7 @@ fn pwb_counters() -> TableIterator<
         name!(aborted_after_charge_count, i64),
     ),
 > {
-    let counters = shmem::snapshot_counters().unwrap_or_else(raise_stats_error);
+    let counters = shmem::snapshot_counters().unwrap_or_else(errors::raise);
     TableIterator::new(vec![counters_row(counters)])
 }
 
@@ -96,7 +95,7 @@ fn pwb_scope_stats() -> TableIterator<
         name!(last_refill_epoch_ms, i64),
     ),
 > {
-    let buckets = shmem::snapshot_budget_buckets().unwrap_or_else(raise_stats_error);
+    let buckets = shmem::snapshot_budget_buckets().unwrap_or_else(errors::raise);
     TableIterator::new(buckets.into_iter().map(scope_stats_row))
 }
 
@@ -114,7 +113,7 @@ fn pwb_query_profiles() -> TableIterator<
         name!(is_global, bool),
     ),
 > {
-    let profiles = shmem::snapshot_query_profiles().unwrap_or_else(raise_stats_error);
+    let profiles = shmem::snapshot_query_profiles().unwrap_or_else(errors::raise);
     TableIterator::new(profiles.into_iter().map(query_profile_row))
 }
 
@@ -140,23 +139,23 @@ fn pwb_recent_decisions(
     ),
 > {
     let limit = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
-    let decisions = shmem::snapshot_recent_decisions(limit).unwrap_or_else(raise_stats_error);
+    let decisions = shmem::snapshot_recent_decisions(limit).unwrap_or_else(errors::raise);
     TableIterator::new(decisions.into_iter().map(recent_decision_row))
 }
 
 #[pg_extern]
 fn pwb_reset_stats() {
-    reset_stats_impl().unwrap_or_else(raise_stats_error);
+    reset_stats_impl().unwrap_or_else(errors::raise);
 }
 
 #[pg_extern]
 fn pwb_reset_profiles() {
-    reset_profiles_impl().unwrap_or_else(raise_stats_error);
+    reset_profiles_impl().unwrap_or_else(errors::raise);
 }
 
 #[pg_extern]
 fn pwb_flush_profiles() {
-    flush_profiles_impl().unwrap_or_else(raise_stats_error);
+    flush_profiles_impl().unwrap_or_else(errors::raise);
 }
 
 fn reset_stats_impl() -> PwbResult<()> {
@@ -249,25 +248,6 @@ const fn u64_to_i64_saturating(value: u64) -> i64 {
     } else {
         value.cast_signed()
     }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn raise_stats_error<T>(error: PwbError) -> T {
-    let message = error.message();
-    let detail = error.to_string();
-    let sqlstate = match error {
-        PwbError::InsufficientPrivilege { .. } => PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
-        PwbError::InvalidBudgetMode { .. }
-        | PwbError::InvalidScopeKind { .. }
-        | PwbError::InvalidPolicyValue { .. } => PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
-        PwbError::Internal { .. } => PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
-        PwbError::MissingScope
-        | PwbError::PredictionUnavailable { .. }
-        | PwbError::BudgetExceeded { .. } => PgSqlErrorCode::ERRCODE_RAISE_EXCEPTION,
-    };
-
-    ereport!(PgLogLevel::ERROR, sqlstate, format!("{message}: {detail}"));
-    unreachable!("ereport(ERROR) should not return");
 }
 
 #[cfg(test)]

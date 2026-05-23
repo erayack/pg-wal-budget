@@ -195,6 +195,8 @@ pub(crate) struct AdmissionDecision {
     pub(crate) kind: DecisionKind,
     pub(crate) policy_id: Option<PolicyId>,
     pub(crate) charged_bytes: WalBytes,
+    pub(crate) available_before: WalBytes,
+    pub(crate) available_after: WalBytes,
     pub(crate) reason_code: ReasonCode,
 }
 
@@ -209,8 +211,6 @@ pub(crate) struct ActiveStatementState {
     pub(crate) scope_hash: ScopeHash,
     pub(crate) statement_class: StatementClass,
     pub(crate) predicted_wal_bytes: WalBytes,
-    pub(crate) available_before: WalBytes,
-    pub(crate) available_after: WalBytes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,6 +237,8 @@ impl AdmissionDecision {
             kind: DecisionKind::Allowed,
             policy_id,
             charged_bytes,
+            available_before: 0,
+            available_after: 0,
             reason_code,
         }
     }
@@ -246,6 +248,8 @@ impl AdmissionDecision {
             kind: DecisionKind::WouldReject,
             policy_id: Some(policy_id),
             charged_bytes,
+            available_before: 0,
+            available_after: 0,
             reason_code: ReasonCode::BudgetExceeded,
         }
     }
@@ -255,6 +259,8 @@ impl AdmissionDecision {
             kind: DecisionKind::Rejected,
             policy_id: Some(policy_id),
             charged_bytes,
+            available_before: 0,
+            available_after: 0,
             reason_code: ReasonCode::BudgetExceeded,
         }
     }
@@ -264,6 +270,8 @@ impl AdmissionDecision {
             kind: DecisionKind::NoMatchingPolicy,
             policy_id: None,
             charged_bytes: 0,
+            available_before: 0,
+            available_after: 0,
             reason_code: ReasonCode::NoMatchingPolicy,
         }
     }
@@ -273,6 +281,8 @@ impl AdmissionDecision {
             kind: DecisionKind::MissingScope,
             policy_id: None,
             charged_bytes: 0,
+            available_before: 0,
+            available_after: 0,
             reason_code: ReasonCode::MissingScope,
         }
     }
@@ -282,8 +292,20 @@ impl AdmissionDecision {
             kind: DecisionKind::InternalErrorFailOpen,
             policy_id: None,
             charged_bytes: 0,
+            available_before: 0,
+            available_after: 0,
             reason_code: ReasonCode::InternalErrorFailOpen,
         }
+    }
+
+    pub(crate) const fn with_availability(
+        mut self,
+        available_before: WalBytes,
+        available_after: WalBytes,
+    ) -> Self {
+        self.available_before = available_before;
+        self.available_after = available_after;
+        self
     }
 }
 

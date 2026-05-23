@@ -17,13 +17,6 @@ pub(crate) struct EffectivePolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BudgetAdmission {
-    pub(crate) decision: AdmissionDecision,
-    pub(crate) available_before: WalBytes,
-    pub(crate) available_after: WalBytes,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RefillResult {
     available_bytes: WalBytes,
     last_refill_epoch_ms: EpochMillis,
@@ -33,7 +26,7 @@ pub(crate) fn admit_statement(
     context: &AdmissionContext,
     policy: &EffectivePolicy,
     now_epoch_ms: EpochMillis,
-) -> PwbResult<BudgetAdmission> {
+) -> PwbResult<AdmissionDecision> {
     if !policy.enabled || matches!(policy.mode, BudgetMode::Off) {
         return Ok(non_charging_admission(
             policy.policy_id,
@@ -101,19 +94,15 @@ const fn initial_bucket_state(
     }
 }
 
-const fn non_charging_admission(policy_id: PolicyId, reason_code: ReasonCode) -> BudgetAdmission {
-    BudgetAdmission {
-        decision: AdmissionDecision::allowed(Some(policy_id), 0, reason_code),
-        available_before: 0,
-        available_after: 0,
-    }
+const fn non_charging_admission(policy_id: PolicyId, reason_code: ReasonCode) -> AdmissionDecision {
+    AdmissionDecision::allowed(Some(policy_id), 0, reason_code)
 }
 
 fn admit_shadow_statement(
     context: &AdmissionContext,
     policy: &EffectivePolicy,
     now_epoch_ms: EpochMillis,
-) -> PwbResult<BudgetAdmission> {
+) -> PwbResult<AdmissionDecision> {
     if !shmem::is_available() {
         return admit_shadow_with_ephemeral_bucket(context, policy, now_epoch_ms);
     }
@@ -131,7 +120,7 @@ fn admit_shadow_with_ephemeral_bucket(
     context: &AdmissionContext,
     policy: &EffectivePolicy,
     now_epoch_ms: EpochMillis,
-) -> PwbResult<BudgetAdmission> {
+) -> PwbResult<AdmissionDecision> {
     let mut bucket = initial_bucket_state(policy, context.scope.value_hash, now_epoch_ms);
     admit_with_bucket(
         context.predicted_wal_bytes,
@@ -146,7 +135,7 @@ fn admit_with_bucket(
     policy: &EffectivePolicy,
     now_epoch_ms: EpochMillis,
     bucket: &mut BudgetBucketState,
-) -> PwbResult<BudgetAdmission> {
+) -> PwbResult<AdmissionDecision> {
     refresh_bucket_policy(bucket, policy);
 
     let refilled = refill_available_bytes(
@@ -168,11 +157,7 @@ fn admit_with_bucket(
             } else {
                 AdmissionDecision::would_reject(policy.policy_id, predicted_wal_bytes)
             };
-            Ok(BudgetAdmission {
-                decision,
-                available_before,
-                available_after: bucket.available_bytes,
-            })
+            Ok(decision.with_availability(available_before, bucket.available_bytes))
         }
         BudgetMode::Reject => {
             if !can_afford(available_before, predicted_wal_bytes) {
@@ -184,15 +169,12 @@ fn admit_with_bucket(
             }
 
             bucket.available_bytes = charge_available(available_before, predicted_wal_bytes);
-            Ok(BudgetAdmission {
-                decision: AdmissionDecision::allowed(
-                    Some(policy.policy_id),
-                    predicted_wal_bytes,
-                    ReasonCode::BudgetAvailable,
-                ),
-                available_before,
-                available_after: bucket.available_bytes,
-            })
+            Ok(AdmissionDecision::allowed(
+                Some(policy.policy_id),
+                predicted_wal_bytes,
+                ReasonCode::BudgetAvailable,
+            )
+            .with_availability(available_before, bucket.available_bytes))
         }
         BudgetMode::Off | BudgetMode::Observe => unreachable!("handled before bucket admission"),
     }
@@ -343,7 +325,7 @@ mod tests {
         let admission = non_charging_admission(POLICY_ID, ReasonCode::PolicyDisabled);
 
         assert_eq!(
-            admission.decision,
+            admission,
             AdmissionDecision::allowed(Some(POLICY_ID), 0, ReasonCode::PolicyDisabled)
         );
     }
@@ -355,8 +337,9 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
 
         assert_eq!(
-            admission.decision,
+            admission,
             AdmissionDecision::allowed(Some(POLICY_ID), 0, ReasonCode::ShadowMode)
+                .with_availability(3000, 3000)
         );
         assert_eq!(bucket.available_bytes, 3000);
     }
@@ -368,8 +351,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
 
         assert_eq!(
-            admission.decision,
-            AdmissionDecision::would_reject(POLICY_ID, 2000)
+            admission,
+            AdmissionDecision::would_reject(POLICY_ID, 2000).with_availability(1000, 1000)
         );
         assert_eq!(bucket.available_bytes, 1000);
     }
@@ -381,8 +364,8 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{error}"));
 
         assert_eq!(
-            admission.decision,
-            AdmissionDecision::would_reject(POLICY_ID, 6000)
+            admission,
+            AdmissionDecision::would_reject(POLICY_ID, 6000).with_availability(5000, 5000)
         );
         assert_eq!(admission.available_before, 5000);
         assert_eq!(admission.available_after, 5000);
@@ -409,8 +392,9 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
 
         assert_eq!(
-            admission.decision,
+            admission,
             AdmissionDecision::allowed(Some(POLICY_ID), 2000, ReasonCode::BudgetAvailable)
+                .with_availability(3000, 1000)
         );
         assert_eq!(bucket.available_bytes, 1000);
         assert_eq!(admission.available_before, 3000);

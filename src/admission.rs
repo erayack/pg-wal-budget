@@ -1,4 +1,4 @@
-use crate::budget::{self, BudgetAdmission};
+use crate::budget;
 use crate::errors::PwbError;
 use crate::policy;
 use crate::shmem::{self, CounterDelta, RecentDecisionRecord};
@@ -28,52 +28,23 @@ pub(crate) fn admit_context(
         policy::effective_policy_for_scope(&context.scope).map_err(AdmissionError::Internal)?
     else {
         let decision = AdmissionDecision::no_matching_policy();
-        record_admission_decision(
-            context,
-            decision,
-            0,
-            0,
-            now_epoch_ms,
-            CounterDelta {
-                accepted_statements: 1,
-                predicted_wal_bytes: context.predicted_wal_bytes,
-                ..CounterDelta::default()
-            },
-        );
-        return Ok(active_statement_from_context(
-            context, origin, decision, 0, 0,
-        ));
+        record_admission_decision(context, decision, now_epoch_ms);
+        return Ok(active_statement_from_context(context, origin, decision));
     };
 
     match budget::admit_statement(context, &effective_policy, now_epoch_ms) {
-        Ok(admission) => {
-            record_budget_admission(context, admission, now_epoch_ms);
-            Ok(active_statement_from_context(
-                context,
-                origin,
-                admission.decision,
-                admission.available_before,
-                admission.available_after,
-            ))
+        Ok(decision) => {
+            record_admission_decision(context, decision, now_epoch_ms);
+            Ok(active_statement_from_context(context, origin, decision))
         }
         Err(PwbError::BudgetExceeded {
             policy_id,
             predicted_wal_bytes,
             available_wal_bytes,
         }) => {
-            let decision = AdmissionDecision::rejected(policy_id, predicted_wal_bytes);
-            record_admission_decision(
-                context,
-                decision,
-                available_wal_bytes,
-                available_wal_bytes,
-                now_epoch_ms,
-                CounterDelta {
-                    rejected_statements: 1,
-                    predicted_wal_bytes,
-                    ..CounterDelta::default()
-                },
-            );
+            let decision = AdmissionDecision::rejected(policy_id, predicted_wal_bytes)
+                .with_availability(available_wal_bytes, available_wal_bytes);
+            record_admission_decision(context, decision, now_epoch_ms);
             Err(AdmissionError::Rejected {
                 policy_id,
                 predicted_wal_bytes,
@@ -87,11 +58,7 @@ pub(crate) fn admit_context(
 pub(crate) fn record_internal_fail_open() {
     let now_epoch_ms = time::current_epoch_ms();
     let decision = AdmissionDecision::internal_error_fail_open();
-    let _ = shmem::add_counters(CounterDelta {
-        accepted_statements: 1,
-        internal_fail_open_count: 1,
-        ..CounterDelta::default()
-    });
+    let _ = shmem::add_counters(counter_delta_for_decision(decision, 0));
     let _ = shmem::record_recent_decision(RecentDecisionRecord {
         timestamp_epoch_ms: now_epoch_ms,
         decision_kind: decision.kind,
@@ -119,8 +86,6 @@ const fn active_statement_from_context(
     context: &AdmissionContext,
     origin: ActiveStatementOrigin,
     decision: AdmissionDecision,
-    available_before: WalBytes,
-    available_after: WalBytes,
 ) -> ActiveStatementState {
     ActiveStatementState {
         origin,
@@ -132,33 +97,30 @@ const fn active_statement_from_context(
         scope_hash: context.scope.value_hash,
         statement_class: context.statement_class,
         predicted_wal_bytes: context.predicted_wal_bytes,
-        available_before,
-        available_after,
     }
 }
 
-fn record_budget_admission(
-    context: &AdmissionContext,
-    admission: BudgetAdmission,
-    now_epoch_ms: EpochMillis,
-) {
-    let delta = match admission.decision.kind {
+fn counter_delta_for_decision(
+    decision: AdmissionDecision,
+    predicted_wal_bytes: WalBytes,
+) -> CounterDelta {
+    match decision.kind {
         DecisionKind::Allowed | DecisionKind::NoMatchingPolicy | DecisionKind::MissingScope => {
             CounterDelta {
                 accepted_statements: 1,
-                predicted_wal_bytes: context.predicted_wal_bytes,
+                predicted_wal_bytes,
                 ..CounterDelta::default()
             }
         }
         DecisionKind::WouldReject => CounterDelta {
             accepted_statements: 1,
             shadow_would_reject_count: 1,
-            predicted_wal_bytes: context.predicted_wal_bytes,
+            predicted_wal_bytes,
             ..CounterDelta::default()
         },
         DecisionKind::Rejected => CounterDelta {
             rejected_statements: 1,
-            predicted_wal_bytes: context.predicted_wal_bytes,
+            predicted_wal_bytes,
             ..CounterDelta::default()
         },
         DecisionKind::InternalErrorFailOpen => CounterDelta {
@@ -166,26 +128,15 @@ fn record_budget_admission(
             internal_fail_open_count: 1,
             ..CounterDelta::default()
         },
-    };
-
-    record_admission_decision(
-        context,
-        admission.decision,
-        admission.available_before,
-        admission.available_after,
-        now_epoch_ms,
-        delta,
-    );
+    }
 }
 
 fn record_admission_decision(
     context: &AdmissionContext,
     decision: AdmissionDecision,
-    available_before: WalBytes,
-    available_after: WalBytes,
     now_epoch_ms: EpochMillis,
-    delta: CounterDelta,
 ) {
+    let delta = counter_delta_for_decision(decision, context.predicted_wal_bytes);
     let _ = shmem::add_counters(delta);
     let _ = shmem::record_recent_decision(RecentDecisionRecord {
         timestamp_epoch_ms: now_epoch_ms,
@@ -197,8 +148,8 @@ fn record_admission_decision(
         statement_class: context.statement_class,
         predicted_wal_bytes: context.predicted_wal_bytes,
         actual_wal_bytes: None,
-        available_before,
-        available_after,
+        available_before: decision.available_before,
+        available_after: decision.available_after,
         reason_code: decision.reason_code,
     });
 }

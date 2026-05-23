@@ -2,6 +2,8 @@
 
 use core::fmt;
 
+use pgrx::{PgLogLevel, PgSqlErrorCode, ereport};
+
 use crate::types::{PolicyId, StatementClass, WalBytes};
 
 pub(crate) const WAL_BUDGET_EXCEEDED_SQLSTATE: &str = "P0001";
@@ -69,6 +71,25 @@ impl PwbError {
             Self::BudgetExceeded { .. } => "pg_wal_budget rejected statement: WAL budget exceeded",
             Self::Internal { .. } => "pg_wal_budget internal error",
         }
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn raise<T>(error: PwbError) -> T {
+    let message = error.message();
+    let detail = error.to_string();
+    let sqlstate = sqlstate_to_error_code(error.sqlstate());
+
+    ereport!(PgLogLevel::ERROR, sqlstate, format!("{message}: {detail}"));
+    unreachable!("ereport(ERROR) should not return");
+}
+
+const fn sqlstate_to_error_code(sqlstate: &str) -> PgSqlErrorCode {
+    match sqlstate.as_bytes() {
+        b"22023" => PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+        b"42501" => PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
+        b"XX000" => PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+        _ => PgSqlErrorCode::ERRCODE_RAISE_EXCEPTION,
     }
 }
 

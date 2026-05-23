@@ -1,10 +1,9 @@
 use std::cell::RefCell;
 
 use pgrx::pg_sys;
-use pgrx::{PgLogLevel, PgSqlErrorCode, ereport};
 
 use crate::admission::{self, AdmissionError};
-use crate::errors::PwbError;
+use crate::errors::{self, PwbError};
 use crate::guc;
 use crate::predict;
 use crate::reconcile;
@@ -217,13 +216,11 @@ fn handle_admission_result(
             policy_id,
             predicted_wal_bytes,
             available_wal_bytes,
-        }) => {
-            raise_pwb_error(PwbError::BudgetExceeded {
-                policy_id,
-                predicted_wal_bytes,
-                available_wal_bytes,
-            });
-        }
+        }) => errors::raise(PwbError::BudgetExceeded {
+            policy_id,
+            predicted_wal_bytes,
+            available_wal_bytes,
+        }),
         Err(AdmissionError::Internal(error)) => {
             handle_internal_admission_error(error);
             None
@@ -279,7 +276,7 @@ fn handle_internal_admission_error(error: PwbError) {
         return;
     }
 
-    raise_pwb_error(error);
+    errors::raise::<()>(error);
 }
 
 fn push_active_statement(statement: ActiveStatementState) {
@@ -323,19 +320,4 @@ impl Drop for AdmissionBypassGuard {
             *depth = depth.saturating_sub(1);
         });
     }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn raise_pwb_error(error: PwbError) -> ! {
-    let sqlstate = match error.sqlstate() {
-        "22023" => PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
-        "42501" => PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
-        "XX000" => PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
-        _ => PgSqlErrorCode::ERRCODE_RAISE_EXCEPTION,
-    };
-    let message = error.message();
-    let detail = error.to_string();
-
-    ereport!(PgLogLevel::ERROR, sqlstate, format!("{message}: {detail}"));
-    unreachable!("ereport(ERROR) should not return");
 }

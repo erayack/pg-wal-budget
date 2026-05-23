@@ -3,10 +3,10 @@
 use std::cell::RefCell;
 use std::ffi::CStr;
 
+use pgrx::pg_sys;
 use pgrx::prelude::*;
-use pgrx::{PgLogLevel, PgSqlErrorCode, ereport, pg_sys};
 
-use crate::errors::{PwbError, PwbResult};
+use crate::errors::{self, PwbError, PwbResult};
 use crate::privileges::{self, ADMIN_ROLE, TENANT_SETTER_ROLE};
 use crate::types::{ScopeHash, ScopeKey, ScopeKind};
 
@@ -25,12 +25,12 @@ pub(crate) struct BackendScopeState {
 
 #[pg_extern]
 fn pwb_set_tenant(tenant: &str) {
-    set_tenant_impl(tenant).unwrap_or_else(raise_scope_error);
+    set_tenant_impl(tenant).unwrap_or_else(errors::raise);
 }
 
 #[pg_extern]
 fn pwb_clear_tenant() {
-    clear_tenant_impl().unwrap_or_else(raise_scope_error);
+    clear_tenant_impl().unwrap_or_else(errors::raise);
 }
 
 pub(crate) fn classify_current_scope() -> PwbResult<ScopeKey> {
@@ -198,27 +198,6 @@ fn fnv1a_update(mut hash: u64, bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn raise_scope_error<T>(error: PwbError) -> T {
-    let sqlstate = match error {
-        PwbError::InsufficientPrivilege { .. } => PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
-        PwbError::MissingScope => PgSqlErrorCode::ERRCODE_RAISE_EXCEPTION,
-        PwbError::InvalidBudgetMode { .. }
-        | PwbError::InvalidScopeKind { .. }
-        | PwbError::InvalidPolicyValue { .. } => PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
-        PwbError::PredictionUnavailable { .. } | PwbError::BudgetExceeded { .. } => {
-            PgSqlErrorCode::ERRCODE_RAISE_EXCEPTION
-        }
-        PwbError::Internal { .. } => PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
-    };
-
-    let message = error.message();
-    let detail = error.to_string();
-
-    ereport!(PgLogLevel::ERROR, sqlstate, format!("{message}: {detail}"));
-    unreachable!("ereport(ERROR) should not return");
 }
 
 #[cfg(test)]

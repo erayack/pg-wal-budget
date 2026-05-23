@@ -31,7 +31,52 @@ pub(crate) fn snapshot_query_profiles() -> PwbResult<Vec<QueryProfileSnapshot>> 
     with_locked_state(|_state, _recent_decisions, profiles| snapshot_profiles_from_slice(profiles))
 }
 
-pub(crate) fn begin_profile_restore(
+pub(crate) fn ensure_profiles_loaded(
+    now_epoch_ms: EpochMillis,
+    stale_after_ms: EpochMillis,
+    load_profiles: impl FnOnce() -> PwbResult<Vec<QueryProfileSnapshot>>,
+) -> PwbResult<()> {
+    if !begin_profile_restore(now_epoch_ms, stale_after_ms)? {
+        return Ok(());
+    }
+
+    let restore_result = (|| {
+        let profiles = load_profiles()?;
+        finish_profile_restore(&profiles)
+    })();
+
+    if restore_result.is_err() {
+        let _ = mark_profile_restore_failed();
+    }
+
+    restore_result
+}
+
+pub(crate) fn persist_profiles_if_due(
+    now_epoch_ms: EpochMillis,
+    interval_ms: EpochMillis,
+    persist_profiles: impl FnOnce(&[QueryProfileSnapshot]) -> PwbResult<()>,
+) -> PwbResult<()> {
+    let Some(profiles) = reserve_profile_persist(now_epoch_ms, interval_ms)? else {
+        return Ok(());
+    };
+
+    let persist_result = persist_profiles(&profiles);
+    let _ = complete_profile_persist(persist_result.is_ok());
+    persist_result
+}
+
+pub(crate) fn persist_profiles_now(
+    now_epoch_ms: EpochMillis,
+    persist_profiles: impl FnOnce(&[QueryProfileSnapshot]) -> PwbResult<()>,
+) -> PwbResult<()> {
+    let profiles = snapshot_profiles_for_persist(now_epoch_ms)?;
+    let persist_result = persist_profiles(&profiles);
+    let _ = complete_profile_persist(persist_result.is_ok());
+    persist_result
+}
+
+fn begin_profile_restore(
     now_epoch_ms: EpochMillis,
     stale_after_ms: EpochMillis,
 ) -> PwbResult<bool> {
@@ -54,7 +99,7 @@ pub(crate) fn begin_profile_restore(
     })
 }
 
-pub(crate) fn finish_profile_restore(restored: &[QueryProfileSnapshot]) -> PwbResult<()> {
+fn finish_profile_restore(restored: &[QueryProfileSnapshot]) -> PwbResult<()> {
     with_locked_state(|state, _recent_decisions, profiles| {
         for snapshot in restored {
             upsert_restored_query_profile_locked(state, profiles, *snapshot)?;
@@ -65,7 +110,7 @@ pub(crate) fn finish_profile_restore(restored: &[QueryProfileSnapshot]) -> PwbRe
     })
 }
 
-pub(crate) fn mark_profile_restore_failed() -> PwbResult<()> {
+fn mark_profile_restore_failed() -> PwbResult<()> {
     with_locked_state(|state, _recent_decisions, _profiles| {
         if state.profile_restore_state == PROFILE_RESTORE_IN_PROGRESS {
             state.profile_restore_state = PROFILE_RESTORE_FAILED;
@@ -75,7 +120,7 @@ pub(crate) fn mark_profile_restore_failed() -> PwbResult<()> {
     })
 }
 
-pub(crate) fn reserve_profile_persist(
+fn reserve_profile_persist(
     now_epoch_ms: EpochMillis,
     interval_ms: EpochMillis,
 ) -> PwbResult<Option<Vec<QueryProfileSnapshot>>> {
@@ -92,7 +137,7 @@ pub(crate) fn reserve_profile_persist(
     })
 }
 
-pub(crate) fn snapshot_profiles_for_persist(
+fn snapshot_profiles_for_persist(
     now_epoch_ms: EpochMillis,
 ) -> PwbResult<Vec<QueryProfileSnapshot>> {
     with_locked_state(|state, _recent_decisions, profiles| {
@@ -101,7 +146,7 @@ pub(crate) fn snapshot_profiles_for_persist(
     })
 }
 
-pub(crate) fn complete_profile_persist(success: bool) -> PwbResult<()> {
+fn complete_profile_persist(success: bool) -> PwbResult<()> {
     with_locked_state(|state, _recent_decisions, _profiles| {
         if success {
             state.profile_dirty_count = 0;

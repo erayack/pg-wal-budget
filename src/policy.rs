@@ -2,13 +2,13 @@
 
 use std::cell::RefCell;
 
+use pgrx::Spi;
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 use pgrx::spi;
-use pgrx::{PgLogLevel, PgSqlErrorCode, Spi, ereport};
 
 use crate::budget::EffectivePolicy;
-use crate::errors::{PwbError, PwbResult};
+use crate::errors::{self, PwbError, PwbResult};
 use crate::hooks;
 use crate::time;
 use crate::types::{BudgetMode, EpochMillis, PolicyId, ScopeKey, ScopeKind, WalBytes};
@@ -264,17 +264,17 @@ fn pwb_create_policy(
         mode,
         priority,
     )
-    .unwrap_or_else(raise_pwb_error)
+    .unwrap_or_else(errors::raise)
 }
 
 #[pg_extern]
 fn pwb_set_policy_mode(policy_id: i32, mode: &str) {
-    set_policy_mode_impl(policy_id, mode).unwrap_or_else(raise_pwb_error);
+    set_policy_mode_impl(policy_id, mode).unwrap_or_else(errors::raise);
 }
 
 #[pg_extern]
 fn pwb_disable_policy(policy_id: i32) {
-    disable_policy_impl(policy_id).unwrap_or_else(raise_pwb_error);
+    disable_policy_impl(policy_id).unwrap_or_else(errors::raise);
 }
 
 fn create_policy_impl(
@@ -432,25 +432,6 @@ fn spi_error(error: spi::Error) -> PwbError {
     PwbError::Internal {
         message: format!("SPI policy operation failed: {error}"),
     }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn raise_pwb_error<T>(error: PwbError) -> T {
-    let message = error.message();
-    let detail = error.to_string();
-    let sqlstate = match error {
-        PwbError::InvalidBudgetMode { .. }
-        | PwbError::InvalidScopeKind { .. }
-        | PwbError::InvalidPolicyValue { .. } => PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
-        PwbError::InsufficientPrivilege { .. } => PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
-        PwbError::Internal { .. } => PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
-        PwbError::MissingScope
-        | PwbError::PredictionUnavailable { .. }
-        | PwbError::BudgetExceeded { .. } => PgSqlErrorCode::ERRCODE_RAISE_EXCEPTION,
-    };
-
-    ereport!(PgLogLevel::ERROR, sqlstate, format!("{message}: {detail}"));
-    unreachable!("ereport(ERROR) should not return");
 }
 
 #[cfg(test)]

@@ -19,9 +19,8 @@ pub(crate) use budget_buckets::{
 pub(crate) use counters::{add_counters, snapshot_counters};
 use layout::{SharedLayout, capacity_to_u32, compute_layout};
 pub(crate) use profiles::{
-    begin_profile_restore, complete_profile_persist, finish_profile_restore,
-    lookup_scoped_or_global_query_profile, mark_profile_restore_failed, reserve_profile_persist,
-    reset_profiles, snapshot_profiles_for_persist, snapshot_query_profiles,
+    ensure_profiles_loaded, lookup_scoped_or_global_query_profile, persist_profiles_if_due,
+    persist_profiles_now, reset_profiles, snapshot_query_profiles,
     upsert_scoped_and_global_query_profiles,
 };
 pub(crate) use recent_decisions::{record_recent_decision, snapshot_recent_decisions};
