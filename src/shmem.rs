@@ -9,8 +9,8 @@ use pgrx::pg_sys;
 use crate::errors::{PwbError, PwbResult};
 use crate::guc;
 use crate::types::{
-    DecisionKind, EpochMillis, PolicyId, QueryId, QueryWalProfile, ReasonCode, ScopeHash,
-    ScopeKind, StatementClass, WalBytes,
+    DecisionKind, EpochMillis, PolicyId, ProfileEwmaWeights, QueryId, QueryWalProfile, ReasonCode,
+    ScopeHash, ScopeKind, StatementClass, WalBytes,
 };
 
 const SHMEM_NAME: &[u8] = b"pg_wal_budget shared state\0";
@@ -229,27 +229,6 @@ pub(crate) struct RecentDecisionRecord {
     pub(crate) available_before: WalBytes,
     pub(crate) available_after: WalBytes,
     pub(crate) reason_code: ReasonCode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ProfileEwmaWeights {
-    pub(crate) numerator: u64,
-    pub(crate) denominator: u64,
-}
-
-impl ProfileEwmaWeights {
-    pub(crate) fn new(numerator: u64, denominator: u64) -> PwbResult<Self> {
-        if denominator == 0 || numerator == 0 || numerator > denominator {
-            return Err(PwbError::Internal {
-                message: format!("invalid profile EWMA weights: {numerator}/{denominator}"),
-            });
-        }
-
-        Ok(Self {
-            numerator,
-            denominator,
-        })
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

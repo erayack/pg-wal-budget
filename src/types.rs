@@ -295,6 +295,27 @@ pub(crate) struct QueryWalProfile {
     pub(crate) last_seen_epoch_ms: EpochMillis,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProfileEwmaWeights {
+    pub(crate) numerator: u64,
+    pub(crate) denominator: u64,
+}
+
+impl ProfileEwmaWeights {
+    pub(crate) fn new(numerator: u64, denominator: u64) -> PwbResult<Self> {
+        if denominator == 0 || numerator == 0 || numerator > denominator {
+            return Err(PwbError::Internal {
+                message: format!("invalid profile EWMA weights: {numerator}/{denominator}"),
+            });
+        }
+
+        Ok(Self {
+            numerator,
+            denominator,
+        })
+    }
+}
+
 impl QueryWalProfile {
     pub(crate) const fn new(first_actual: WalBytes, now_epoch_ms: EpochMillis) -> Self {
         Self {

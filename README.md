@@ -83,6 +83,9 @@ Runtime GUCs (SIGHUP):
 | `pwb.default_write_wal_bytes` | `16kB` | Fallback prediction for writes. |
 | `pwb.default_utility_wal_bytes` | `1MB` | Fallback prediction for utility / `COPY`. |
 | `pwb.max_prediction_bytes` | `1GB` | Upper bound on predictions. |
+| `pwb.profile_ewma_alpha` | `0.5` | EWMA smoothing factor for learned query WAL profiles. |
+
+Lower `pwb.profile_ewma_alpha` values smooth predictions over more history; higher values react faster to recent WAL observations.
 
 Postmaster GUCs (restart required, sized into shared memory):
 

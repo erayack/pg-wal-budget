@@ -1,6 +1,7 @@
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 
-use crate::types::WalBytes;
+use crate::errors::{PwbError, PwbResult};
+use crate::types::{ProfileEwmaWeights, WalBytes};
 
 const DEFAULT_WRITE_WAL_BYTES_VALUE: i32 = 16 * 1024;
 const DEFAULT_UTILITY_WAL_BYTES_VALUE: i32 = 1024 * 1024;
@@ -8,6 +9,10 @@ const MAX_PREDICTION_BYTES_VALUE: i32 = 1024 * 1024 * 1024;
 const RECENT_DECISION_CAPACITY_VALUE: i32 = 1024;
 const PROFILE_CACHE_CAPACITY_VALUE: i32 = 4096;
 const MAX_CAPACITY_VALUE: i32 = 1_000_000;
+const DEFAULT_PROFILE_EWMA_ALPHA_VALUE: f64 = 0.5;
+const MIN_PROFILE_EWMA_ALPHA_VALUE: f64 = 0.000001;
+const MAX_PROFILE_EWMA_ALPHA_VALUE: f64 = 1.0;
+const PROFILE_EWMA_ALPHA_DENOMINATOR: u64 = 1_000_000;
 
 static ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 static FAIL_OPEN: GucSetting<bool> = GucSetting::<bool>::new(true);
@@ -20,6 +25,8 @@ static RECENT_DECISION_CAPACITY: GucSetting<i32> =
     GucSetting::<i32>::new(RECENT_DECISION_CAPACITY_VALUE);
 static PROFILE_CACHE_CAPACITY: GucSetting<i32> =
     GucSetting::<i32>::new(PROFILE_CACHE_CAPACITY_VALUE);
+static PROFILE_EWMA_ALPHA: GucSetting<f64> =
+    GucSetting::<f64>::new(DEFAULT_PROFILE_EWMA_ALPHA_VALUE);
 
 pub(crate) fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -71,6 +78,17 @@ pub(crate) fn register_gucs() {
         i32::MAX,
         GucContext::Sighup,
         GucFlags::UNIT_BYTE,
+    );
+
+    GucRegistry::define_float_guc(
+        c"pwb.profile_ewma_alpha",
+        c"EWMA smoothing factor for query WAL profiles.",
+        c"Controls how strongly learned pg_wal_budget query WAL profiles weight the latest observation. Higher values react faster; lower values smooth over more history.",
+        &PROFILE_EWMA_ALPHA,
+        MIN_PROFILE_EWMA_ALPHA_VALUE,
+        MAX_PROFILE_EWMA_ALPHA_VALUE,
+        GucContext::Sighup,
+        GucFlags::default(),
     );
 
     GucRegistry::define_int_guc(
@@ -131,6 +149,11 @@ pub(crate) fn profile_cache_capacity() -> usize {
     nonnegative_i32_to_usize(PROFILE_CACHE_CAPACITY.get())
 }
 
+#[allow(dead_code)]
+pub(crate) fn profile_ewma_alpha_weights() -> PwbResult<ProfileEwmaWeights> {
+    alpha_to_profile_ewma_weights(PROFILE_EWMA_ALPHA.get())
+}
+
 const fn nonnegative_i32_to_wal_bytes(value: i32) -> WalBytes {
     if value <= 0 {
         0
@@ -145,6 +168,22 @@ const fn nonnegative_i32_to_usize(value: i32) -> usize {
     } else {
         value.cast_unsigned() as usize
     }
+}
+
+fn alpha_to_profile_ewma_weights(alpha: f64) -> PwbResult<ProfileEwmaWeights> {
+    if !alpha.is_finite()
+        || !(MIN_PROFILE_EWMA_ALPHA_VALUE..=MAX_PROFILE_EWMA_ALPHA_VALUE).contains(&alpha)
+    {
+        return Err(PwbError::Internal {
+            message: format!("invalid profile EWMA alpha: {alpha}"),
+        });
+    }
+
+    let numerator = (alpha * PROFILE_EWMA_ALPHA_DENOMINATOR as f64).round() as u64;
+    ProfileEwmaWeights::new(
+        numerator.clamp(1, PROFILE_EWMA_ALPHA_DENOMINATOR),
+        PROFILE_EWMA_ALPHA_DENOMINATOR,
+    )
 }
 
 #[cfg(test)]
@@ -180,5 +219,44 @@ mod tests {
     fn negative_values_convert_to_zero_at_accessor_boundary() {
         assert_eq!(nonnegative_i32_to_wal_bytes(-1), 0);
         assert_eq!(nonnegative_i32_to_usize(-1), 0);
+    }
+
+    #[test]
+    fn default_profile_ewma_alpha_matches_previous_half_weight() {
+        let weights = alpha_to_profile_ewma_weights(DEFAULT_PROFILE_EWMA_ALPHA_VALUE)
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(weights.numerator, 500_000);
+        assert_eq!(weights.denominator, PROFILE_EWMA_ALPHA_DENOMINATOR);
+    }
+
+    #[test]
+    fn profile_ewma_alpha_converts_common_values() {
+        let low = alpha_to_profile_ewma_weights(0.2).unwrap_or_else(|error| panic!("{error}"));
+        let max = alpha_to_profile_ewma_weights(1.0).unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(low.numerator, 200_000);
+        assert_eq!(low.denominator, PROFILE_EWMA_ALPHA_DENOMINATOR);
+        assert_eq!(max.numerator, PROFILE_EWMA_ALPHA_DENOMINATOR);
+        assert_eq!(max.denominator, PROFILE_EWMA_ALPHA_DENOMINATOR);
+    }
+
+    #[test]
+    fn minimum_profile_ewma_alpha_converts_to_nonzero_numerator() {
+        let weights = alpha_to_profile_ewma_weights(MIN_PROFILE_EWMA_ALPHA_VALUE)
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(weights.numerator, 1);
+        assert_eq!(weights.denominator, PROFILE_EWMA_ALPHA_DENOMINATOR);
+    }
+
+    #[test]
+    fn invalid_profile_ewma_alpha_values_are_rejected() {
+        assert!(alpha_to_profile_ewma_weights(0.0).is_err());
+        assert!(alpha_to_profile_ewma_weights(MIN_PROFILE_EWMA_ALPHA_VALUE / 2.0).is_err());
+        assert!(alpha_to_profile_ewma_weights(-0.1).is_err());
+        assert!(alpha_to_profile_ewma_weights(f64::NAN).is_err());
+        assert!(alpha_to_profile_ewma_weights(f64::INFINITY).is_err());
+        assert!(alpha_to_profile_ewma_weights(1.1).is_err());
     }
 }
