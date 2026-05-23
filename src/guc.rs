@@ -10,7 +10,7 @@ const RECENT_DECISION_CAPACITY_VALUE: i32 = 1024;
 const PROFILE_CACHE_CAPACITY_VALUE: i32 = 4096;
 const MAX_CAPACITY_VALUE: i32 = 1_000_000;
 const DEFAULT_PROFILE_EWMA_ALPHA_VALUE: f64 = 0.5;
-const MIN_PROFILE_EWMA_ALPHA_VALUE: f64 = 0.000001;
+const MIN_PROFILE_EWMA_ALPHA_VALUE: f64 = 0.000_001;
 const MAX_PROFILE_EWMA_ALPHA_VALUE: f64 = 1.0;
 const PROFILE_EWMA_ALPHA_DENOMINATOR: u64 = 1_000_000;
 
@@ -170,6 +170,12 @@ const fn nonnegative_i32_to_usize(value: i32) -> usize {
     }
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "profile EWMA alpha is range-checked to 0.000_001..=1.0 and scaled by a small fixed denominator"
+)]
 fn alpha_to_profile_ewma_weights(alpha: f64) -> PwbResult<ProfileEwmaWeights> {
     if !alpha.is_finite()
         || !(MIN_PROFILE_EWMA_ALPHA_VALUE..=MAX_PROFILE_EWMA_ALPHA_VALUE).contains(&alpha)

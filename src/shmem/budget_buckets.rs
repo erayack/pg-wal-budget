@@ -1,10 +1,8 @@
 use crate::errors::PwbResult;
 use crate::types::{PolicyId, ScopeHash};
 
-use super::{
-    BudgetBucketSnapshot, BudgetBucketState, PwbBudgetBucket, PwbSharedState,
-    budget_bucket_capacity_exhausted, with_locked_bucket_state,
-};
+use super::records::{BudgetBucketSnapshot, BudgetBucketState, PwbBudgetBucket, PwbSharedState};
+use super::{budget_bucket_capacity_exhausted, with_locked_bucket_state};
 
 pub(crate) fn snapshot_budget_buckets() -> PwbResult<Vec<BudgetBucketSnapshot>> {
     with_locked_bucket_state(|_state, buckets| snapshot_budget_buckets_from_slice(buckets))
@@ -38,7 +36,7 @@ pub(crate) fn with_existing_budget_bucket<R>(
     })
 }
 
-pub(super) fn apply_budget_bucket<R>(
+fn apply_budget_bucket<R>(
     state: &mut PwbSharedState,
     buckets: &mut [PwbBudgetBucket],
     policy_id: PolicyId,
@@ -69,7 +67,7 @@ pub(super) fn apply_budget_bucket<R>(
     Ok(result)
 }
 
-pub(super) fn snapshot_budget_buckets_from_slice(
+fn snapshot_budget_buckets_from_slice(
     buckets: &[PwbBudgetBucket],
 ) -> PwbResult<Vec<BudgetBucketSnapshot>> {
     let mut snapshots = Vec::new();
@@ -102,4 +100,108 @@ fn find_budget_bucket_slot(
 
 fn find_empty_budget_bucket_slot(buckets: &[PwbBudgetBucket]) -> Option<usize> {
     buckets.iter().position(|bucket| bucket.occupied == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::PwbError;
+    use crate::shmem::records::test_state;
+
+    #[test]
+    fn snapshots_only_occupied_budget_buckets() {
+        let buckets = [
+            PwbBudgetBucket::encode(BudgetBucketState {
+                policy_id: 7,
+                scope_hash: 99,
+                available_bytes: 1024,
+                max_burst_bytes: 4096,
+                rate_bytes_per_sec: 512,
+                last_refill_epoch_ms: 123,
+                debt_bytes: 64,
+            }),
+            PwbBudgetBucket::default(),
+        ];
+
+        let snapshots =
+            snapshot_budget_buckets_from_slice(&buckets).unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].policy_id, 7);
+        assert_eq!(snapshots[0].scope_hash, 99);
+        assert_eq!(snapshots[0].debt_bytes, 64);
+    }
+
+    #[test]
+    fn new_budget_bucket_is_not_persisted_when_callback_errors() {
+        let mut state = test_state(1);
+        let mut buckets = [PwbBudgetBucket::default()];
+        let error = match apply_budget_bucket(
+            &mut state,
+            &mut buckets,
+            7,
+            99,
+            || BudgetBucketState {
+                policy_id: 7,
+                scope_hash: 99,
+                available_bytes: 1024,
+                max_burst_bytes: 4096,
+                rate_bytes_per_sec: 512,
+                last_refill_epoch_ms: 123,
+                debt_bytes: 0,
+            },
+            |_bucket| {
+                Err(PwbError::BudgetExceeded {
+                    policy_id: 7,
+                    predicted_wal_bytes: 2048,
+                    available_wal_bytes: 1024,
+                })
+            },
+        ) {
+            Ok(()) => panic!("expected callback error"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, PwbError::BudgetExceeded { .. }));
+        assert_eq!(state.budget_buckets_len, 0);
+        assert_eq!(buckets[0], PwbBudgetBucket::default());
+    }
+
+    #[test]
+    fn existing_budget_bucket_is_persisted_when_callback_succeeds() {
+        let mut state = test_state(1);
+        state.budget_buckets_len = 1;
+        let initial = BudgetBucketState {
+            policy_id: 7,
+            scope_hash: 99,
+            available_bytes: 1024,
+            max_burst_bytes: 4096,
+            rate_bytes_per_sec: 512,
+            last_refill_epoch_ms: 123,
+            debt_bytes: 0,
+        };
+        let mut buckets = [PwbBudgetBucket::encode(initial)];
+
+        apply_budget_bucket(
+            &mut state,
+            &mut buckets,
+            7,
+            99,
+            || panic!("existing bucket should not be initialized"),
+            |bucket| {
+                bucket.available_bytes = 256;
+                Ok(())
+            },
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(state.budget_buckets_len, 1);
+        assert_eq!(
+            buckets[0]
+                .decode()
+                .unwrap_or_else(|error| panic!("{error}"))
+                .available_bytes,
+            256
+        );
+    }
 }

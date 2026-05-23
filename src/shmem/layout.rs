@@ -2,7 +2,7 @@ use core::mem::{align_of, size_of};
 
 use crate::errors::{PwbError, PwbResult};
 
-use super::{PwbBudgetBucket, PwbProfileEntry, PwbRecentDecision, PwbSharedState};
+use super::records::{PwbBudgetBucket, PwbProfileEntry, PwbRecentDecision, PwbSharedState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SharedLayout {
@@ -95,4 +95,42 @@ fn checked_mul(left: usize, right: usize) -> PwbResult<usize> {
 pub(super) const fn capacity_to_u32(capacity: usize) -> u32 {
     // Shared memory layout capacities are derived from postmaster GUCs with a u32-safe upper bound.
     capacity as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn computes_aligned_layout() {
+        let layout = compute_layout(3, 5).unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(layout.total_bytes >= size_of::<PwbSharedState>());
+        assert_eq!(
+            layout.recent_decisions_offset % align_of::<PwbRecentDecision>(),
+            0
+        );
+        assert_eq!(layout.profiles_offset % align_of::<PwbProfileEntry>(), 0);
+        assert_eq!(
+            layout.budget_buckets_offset % align_of::<PwbBudgetBucket>(),
+            0
+        );
+        assert_eq!(layout.recent_decision_capacity, 3);
+        assert_eq!(layout.profile_cache_capacity, 5);
+        assert_eq!(layout.budget_bucket_capacity, 5);
+    }
+
+    #[test]
+    fn allows_zero_capacity_layout() {
+        let layout = compute_layout(0, 0).unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(layout.recent_decision_capacity, 0);
+        assert_eq!(layout.profile_cache_capacity, 0);
+        assert_eq!(layout.budget_bucket_capacity, 0);
+    }
+
+    #[test]
+    fn rejects_layout_overflow() {
+        assert!(compute_layout(usize::MAX, 1).is_err());
+    }
 }

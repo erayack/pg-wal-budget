@@ -1,9 +1,7 @@
 use crate::errors::{PwbError, PwbResult};
 
-use super::{
-    PwbRecentDecision, RecentDecisionRecord, recent_decision_capacity, recent_decision_count,
-    ring_slot, with_locked_state,
-};
+use super::records::{PwbRecentDecision, PwbSharedState, RecentDecisionRecord};
+use super::with_locked_state;
 
 pub(crate) fn record_recent_decision(record: RecentDecisionRecord) -> PwbResult<()> {
     with_locked_state(|state, recent_decisions, _profiles| {
@@ -55,4 +53,36 @@ pub(crate) fn snapshot_recent_decisions(limit: usize) -> PwbResult<Vec<RecentDec
 
         Ok(records)
     })
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "modulo result is strictly less than the usize capacity"
+)]
+fn ring_slot(sequence: u64, capacity: usize) -> usize {
+    // Callers check the ring capacity once at the boundary; this helper stays infallible for the
+    // shared-memory hot path.
+    debug_assert!(capacity > 0);
+    (sequence % capacity as u64) as usize
+}
+
+const fn recent_decision_capacity(state: &PwbSharedState) -> usize {
+    state.recent_decision_capacity as usize
+}
+
+const fn recent_decision_count(state: &PwbSharedState) -> usize {
+    state.recent_decision_count as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_ring_sequence_to_slot() {
+        assert_eq!(ring_slot(0, 4), 0);
+        assert_eq!(ring_slot(3, 4), 3);
+        assert_eq!(ring_slot(4, 4), 0);
+        assert_eq!(ring_slot(9, 4), 1);
+    }
 }
