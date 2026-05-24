@@ -91,8 +91,7 @@ Postmaster GUCs (restart required, sized into shared memory):
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
-| `pwb.recent_decision_capacity` | `1024` | Recent-decision ring buffer. |
-| `pwb.profile_cache_capacity` | `4096` | Query WAL profile cache. |
+| `pwb.shmem_capacity` | `4096` | Capacity for each shared-memory array: recent decisions, query WAL profiles, and budget buckets. Changes require restart. |
 
 Emergency disable:
 

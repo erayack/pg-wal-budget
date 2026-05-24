@@ -10,9 +10,7 @@ pub(super) struct SharedLayout {
     pub(super) recent_decisions_offset: usize,
     pub(super) profiles_offset: usize,
     pub(super) budget_buckets_offset: usize,
-    pub(super) recent_decision_capacity: usize,
-    pub(super) profile_cache_capacity: usize,
-    pub(super) budget_bucket_capacity: usize,
+    pub(super) capacity: usize,
 }
 
 impl SharedLayout {
@@ -22,51 +20,35 @@ impl SharedLayout {
             recent_decisions_offset: 0,
             profiles_offset: 0,
             budget_buckets_offset: 0,
-            recent_decision_capacity: 0,
-            profile_cache_capacity: 0,
-            budget_bucket_capacity: 0,
+            capacity: 0,
         }
     }
 }
 
-pub(super) fn compute_layout(
-    recent_decision_capacity: usize,
-    profile_cache_capacity: usize,
-) -> PwbResult<SharedLayout> {
+pub(super) fn compute_layout(capacity: usize) -> PwbResult<SharedLayout> {
     let mut offset = size_of::<PwbSharedState>();
 
     offset = align_up(offset, align_of::<PwbRecentDecision>())?;
     let recent_decisions_offset = offset;
     offset = checked_add(
         offset,
-        checked_mul(recent_decision_capacity, size_of::<PwbRecentDecision>())?,
+        checked_mul(capacity, size_of::<PwbRecentDecision>())?,
     )?;
 
     offset = align_up(offset, align_of::<PwbProfileEntry>())?;
     let profiles_offset = offset;
-    offset = checked_add(
-        offset,
-        checked_mul(profile_cache_capacity, size_of::<PwbProfileEntry>())?,
-    )?;
+    offset = checked_add(offset, checked_mul(capacity, size_of::<PwbProfileEntry>())?)?;
 
     offset = align_up(offset, align_of::<PwbBudgetBucket>())?;
     let budget_buckets_offset = offset;
-    // Until pg_wal_budget has a dedicated bucket-capacity GUC, bucket capacity tracks the profile
-    // cache capacity so shared-memory sizing remains bounded by existing postmaster settings.
-    let budget_bucket_capacity = profile_cache_capacity;
-    offset = checked_add(
-        offset,
-        checked_mul(budget_bucket_capacity, size_of::<PwbBudgetBucket>())?,
-    )?;
+    offset = checked_add(offset, checked_mul(capacity, size_of::<PwbBudgetBucket>())?)?;
 
     Ok(SharedLayout {
         total_bytes: offset,
         recent_decisions_offset,
         profiles_offset,
         budget_buckets_offset,
-        recent_decision_capacity,
-        profile_cache_capacity,
-        budget_bucket_capacity,
+        capacity,
     })
 }
 
@@ -103,7 +85,7 @@ mod tests {
 
     #[test]
     fn computes_aligned_layout() {
-        let layout = compute_layout(3, 5).unwrap_or_else(|error| panic!("{error}"));
+        let layout = compute_layout(5).unwrap_or_else(|error| panic!("{error}"));
 
         assert!(layout.total_bytes >= size_of::<PwbSharedState>());
         assert_eq!(
@@ -115,22 +97,18 @@ mod tests {
             layout.budget_buckets_offset % align_of::<PwbBudgetBucket>(),
             0
         );
-        assert_eq!(layout.recent_decision_capacity, 3);
-        assert_eq!(layout.profile_cache_capacity, 5);
-        assert_eq!(layout.budget_bucket_capacity, 5);
+        assert_eq!(layout.capacity, 5);
     }
 
     #[test]
     fn allows_zero_capacity_layout() {
-        let layout = compute_layout(0, 0).unwrap_or_else(|error| panic!("{error}"));
+        let layout = compute_layout(0).unwrap_or_else(|error| panic!("{error}"));
 
-        assert_eq!(layout.recent_decision_capacity, 0);
-        assert_eq!(layout.profile_cache_capacity, 0);
-        assert_eq!(layout.budget_bucket_capacity, 0);
+        assert_eq!(layout.capacity, 0);
     }
 
     #[test]
     fn rejects_layout_overflow() {
-        assert!(compute_layout(usize::MAX, 1).is_err());
+        assert!(compute_layout(usize::MAX).is_err());
     }
 }

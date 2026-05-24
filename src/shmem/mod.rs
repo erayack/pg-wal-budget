@@ -33,7 +33,7 @@ use records::{PwbBudgetBucket, PwbProfileEntry, PwbRecentDecision, PwbSharedStat
 const SHMEM_NAME: &[u8] = b"pg_wal_budget shared state\0";
 const LWLOCK_TRANCHE_NAME: &[u8] = b"pg_wal_budget\0";
 const MAGIC: u32 = 0x5057_4201;
-const LAYOUT_VERSION: u32 = 3;
+const LAYOUT_VERSION: u32 = 4;
 static mut SHARED_STATE: *mut PwbSharedState = ptr::null_mut();
 static mut SHARED_LOCK: *mut pg_sys::LWLock = ptr::null_mut();
 static mut PREV_SHMEM_REQUEST_HOOK: pg_sys::shmem_request_hook_type = None;
@@ -60,10 +60,7 @@ unsafe extern "C-unwind" fn shmem_request() {
         }
     }
 
-    let layout = match compute_layout(
-        guc::recent_decision_capacity(),
-        guc::profile_cache_capacity(),
-    ) {
+    let layout = match compute_layout(guc::shmem_capacity()) {
         Ok(layout) => layout,
         Err(error) => raise_startup_error(&error),
     };
@@ -155,9 +152,7 @@ unsafe fn initialize_state(state: *mut PwbSharedState, layout: SharedLayout) {
             PwbSharedState {
                 magic: MAGIC,
                 layout_version: LAYOUT_VERSION,
-                recent_decision_capacity: capacity_to_u32(layout.recent_decision_capacity),
-                profile_cache_capacity: capacity_to_u32(layout.profile_cache_capacity),
-                budget_bucket_capacity: capacity_to_u32(layout.budget_bucket_capacity),
+                shmem_capacity: capacity_to_u32(layout.capacity),
                 recent_decision_head: 0,
                 recent_decision_count: 0,
                 profiles_len: 0,
@@ -190,7 +185,7 @@ fn with_locked_state<R>(
         slice_from_region_mut::<PwbRecentDecision>(
             ptr::from_mut(state).cast::<u8>(),
             layout.recent_decisions_offset,
-            layout.recent_decision_capacity,
+            layout.capacity,
         )
     };
     // SAFETY: Same as above; this region begins at the precomputed profile offset.
@@ -198,7 +193,7 @@ fn with_locked_state<R>(
         slice_from_region_mut::<PwbProfileEntry>(
             ptr::from_mut(state).cast::<u8>(),
             layout.profiles_offset,
-            layout.profile_cache_capacity,
+            layout.capacity,
         )
     };
 
@@ -218,7 +213,7 @@ fn with_locked_bucket_state<R>(
         slice_from_region_mut::<PwbBudgetBucket>(
             ptr::from_mut(state).cast::<u8>(),
             layout.budget_buckets_offset,
-            layout.budget_bucket_capacity,
+            layout.capacity,
         )
     };
 

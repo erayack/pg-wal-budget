@@ -22,7 +22,7 @@ pub(crate) fn record_recent_decision(record: RecentDecisionRecord) -> PwbResult<
         state.recent_decision_count = state
             .recent_decision_count
             .saturating_add(1)
-            .min(state.recent_decision_capacity);
+            .min(state.shmem_capacity);
         Ok(())
     })
 }
@@ -67,7 +67,7 @@ fn ring_slot(sequence: u64, capacity: usize) -> usize {
 }
 
 const fn recent_decision_capacity(state: &PwbSharedState) -> usize {
-    state.recent_decision_capacity as usize
+    state.shmem_capacity as usize
 }
 
 const fn recent_decision_count(state: &PwbSharedState) -> usize {

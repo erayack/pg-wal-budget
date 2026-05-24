@@ -63,7 +63,7 @@ pub(crate) fn flush_profiles() -> PwbResult<()> {
 fn ensure_profiles_loaded() -> PwbResult<()> {
     let now_epoch_ms = time::current_epoch_ms();
     shmem::ensure_profiles_loaded(now_epoch_ms, PROFILE_RESTORE_STALE_MS, || {
-        profile_store::load_profiles(guc::profile_cache_capacity())
+        profile_store::load_profiles(guc::shmem_capacity())
     })
 }
 

@@ -6,8 +6,7 @@ use crate::types::{ProfileEwmaWeights, WalBytes};
 const DEFAULT_WRITE_WAL_BYTES_VALUE: i32 = 16 * 1024;
 const DEFAULT_UTILITY_WAL_BYTES_VALUE: i32 = 1024 * 1024;
 const MAX_PREDICTION_BYTES_VALUE: i32 = 1024 * 1024 * 1024;
-const RECENT_DECISION_CAPACITY_VALUE: i32 = 1024;
-const PROFILE_CACHE_CAPACITY_VALUE: i32 = 4096;
+const SHMEM_CAPACITY_VALUE: i32 = 4096;
 const MAX_CAPACITY_VALUE: i32 = 1_000_000;
 const DEFAULT_PROFILE_EWMA_ALPHA_VALUE: f64 = 0.5;
 const MIN_PROFILE_EWMA_ALPHA_VALUE: f64 = 0.000_001;
@@ -21,10 +20,7 @@ static DEFAULT_WRITE_WAL_BYTES: GucSetting<i32> =
 static DEFAULT_UTILITY_WAL_BYTES: GucSetting<i32> =
     GucSetting::<i32>::new(DEFAULT_UTILITY_WAL_BYTES_VALUE);
 static MAX_PREDICTION_BYTES: GucSetting<i32> = GucSetting::<i32>::new(MAX_PREDICTION_BYTES_VALUE);
-static RECENT_DECISION_CAPACITY: GucSetting<i32> =
-    GucSetting::<i32>::new(RECENT_DECISION_CAPACITY_VALUE);
-static PROFILE_CACHE_CAPACITY: GucSetting<i32> =
-    GucSetting::<i32>::new(PROFILE_CACHE_CAPACITY_VALUE);
+static SHMEM_CAPACITY: GucSetting<i32> = GucSetting::<i32>::new(SHMEM_CAPACITY_VALUE);
 static PROFILE_EWMA_ALPHA: GucSetting<f64> =
     GucSetting::<f64>::new(DEFAULT_PROFILE_EWMA_ALPHA_VALUE);
 
@@ -92,21 +88,10 @@ pub(crate) fn register_gucs() {
     );
 
     GucRegistry::define_int_guc(
-        c"pwb.recent_decision_capacity",
-        c"Recent decision ring buffer capacity.",
-        c"Maximum number of recent pg_wal_budget admission decisions retained in shared memory. Changes require restart.",
-        &RECENT_DECISION_CAPACITY,
-        0,
-        MAX_CAPACITY_VALUE,
-        GucContext::Postmaster,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_int_guc(
-        c"pwb.profile_cache_capacity",
-        c"Query profile cache capacity.",
-        c"Maximum number of query WAL profiles retained in shared memory. Changes require restart.",
-        &PROFILE_CACHE_CAPACITY,
+        c"pwb.shmem_capacity",
+        c"Shared memory array capacity.",
+        c"Capacity of each pg_wal_budget shared-memory array: recent decisions, query WAL profiles, and budget buckets. Changes require restart.",
+        &SHMEM_CAPACITY,
         0,
         MAX_CAPACITY_VALUE,
         GucContext::Postmaster,
@@ -140,13 +125,8 @@ pub(crate) fn max_prediction_bytes() -> WalBytes {
 }
 
 #[allow(dead_code)]
-pub(crate) fn recent_decision_capacity() -> usize {
-    nonnegative_i32_to_usize(RECENT_DECISION_CAPACITY.get())
-}
-
-#[allow(dead_code)]
-pub(crate) fn profile_cache_capacity() -> usize {
-    nonnegative_i32_to_usize(PROFILE_CACHE_CAPACITY.get())
+pub(crate) fn shmem_capacity() -> usize {
+    nonnegative_i32_to_usize(SHMEM_CAPACITY.get())
 }
 
 #[allow(dead_code)]
@@ -214,11 +194,7 @@ mod tests {
 
     #[test]
     fn capacity_defaults_fit_usize() {
-        assert_eq!(
-            nonnegative_i32_to_usize(RECENT_DECISION_CAPACITY_VALUE),
-            1024
-        );
-        assert_eq!(nonnegative_i32_to_usize(PROFILE_CACHE_CAPACITY_VALUE), 4096);
+        assert_eq!(nonnegative_i32_to_usize(SHMEM_CAPACITY_VALUE), 4096);
     }
 
     #[test]

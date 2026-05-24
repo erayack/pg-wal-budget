@@ -63,7 +63,7 @@ fn apply_budget_bucket<R>(
     state.budget_buckets_len = state
         .budget_buckets_len
         .saturating_add(1)
-        .min(state.budget_bucket_capacity);
+        .min(state.shmem_capacity);
     Ok(result)
 }
 
