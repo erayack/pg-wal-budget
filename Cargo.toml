@@ -1,6 +1,6 @@
 [package]
 name = "pg_wal_budget"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "PostgreSQL extension for observing and enforcing WAL-generation budgets by policy scope"
 license = "MIT"

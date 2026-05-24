@@ -2,7 +2,7 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-changed=sql/pg_wal_budget--0.1.0.sql");
+    println!("cargo:rerun-if-changed=sql/pg_wal_budget--0.2.0.sql");
     println!("cargo:rerun-if-changed=scripts/generate_pgrx_bootstrap.sh");
 
     let script = Path::new("scripts/generate_pgrx_bootstrap.sh");
