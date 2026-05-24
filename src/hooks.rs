@@ -5,7 +5,7 @@ use pgrx::pg_sys;
 use crate::admission::{self, AdmissionError};
 use crate::errors::{self, PwbError};
 use crate::guc;
-use crate::predict;
+use crate::profile;
 use crate::reconcile;
 use crate::scope;
 use crate::types::{
@@ -191,8 +191,7 @@ fn admit_normal_statement(
     let statement_class = classify_planned_statement(planned_statement);
     let query_id = extract_query_id(planned_statement);
     let scope = scope::classify_current_scope().map_err(AdmissionError::Internal)?;
-    let predicted_wal_bytes =
-        predict::predict_wal_bytes(statement_class, query_id, scope.value_hash);
+    let predicted_wal_bytes = profile::predict(statement_class, query_id, scope.value_hash);
     let context = AdmissionContext {
         query_id,
         scope,
