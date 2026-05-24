@@ -31,17 +31,6 @@ pub(crate) struct PolicyDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RawEffectivePolicy {
-    policy_id: Option<PolicyId>,
-    scope_kind: Option<String>,
-    scope_value: Option<String>,
-    enabled: Option<bool>,
-    mode: Option<String>,
-    wal_rate_bytes_per_sec: Option<i64>,
-    wal_burst_bytes: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct CachedEffectivePolicy {
     scope_kind: ScopeKind,
     scope_value: Option<String>,
@@ -130,9 +119,10 @@ fn load_policy_cache(now_epoch_ms: EpochMillis) -> PwbResult<PolicyCache> {
         });
     }
 
-    let raw_policies = Spi::connect(|client| {
-        let table = client.select(
-            "
+    let policies = Spi::connect(|client| -> PwbResult<Vec<CachedEffectivePolicy>> {
+        let table = client
+            .select(
+                "
                 select
                   policy_id,
                   scope_kind,
@@ -145,30 +135,51 @@ fn load_policy_cache(now_epoch_ms: EpochMillis) -> PwbResult<PolicyCache> {
                 where enabled = true
                 order by priority desc, policy_id asc
                 ",
-            None,
-            &[],
-        )?;
+                None,
+                &[],
+            )
+            .map_err(spi_error)?;
 
         let mut policies = Vec::with_capacity(table.len());
         for row in table {
-            policies.push(RawEffectivePolicy {
-                policy_id: row.get_by_name::<PolicyId, _>("policy_id")?,
-                scope_kind: row.get_by_name::<String, _>("scope_kind")?,
-                scope_value: row.get_by_name::<String, _>("scope_value")?,
-                enabled: row.get_by_name::<bool, _>("enabled")?,
-                mode: row.get_by_name::<String, _>("mode")?,
-                wal_rate_bytes_per_sec: row.get_by_name::<i64, _>("wal_rate_bytes_per_sec")?,
-                wal_burst_bytes: row.get_by_name::<i64, _>("wal_burst_bytes")?,
+            let policy_id =
+                required_policy_field("policy_id", row.get_by_name::<PolicyId, _>("policy_id"))?;
+            let scope_kind =
+                required_policy_field("scope_kind", row.get_by_name::<String, _>("scope_kind"))?;
+            let scope_value = row
+                .get_by_name::<String, _>("scope_value")
+                .map_err(spi_error)?;
+            let enabled = required_policy_field("enabled", row.get_by_name::<bool, _>("enabled"))?;
+            let mode = required_policy_field("mode", row.get_by_name::<String, _>("mode"))?;
+            let wal_rate_bytes_per_sec = required_policy_field(
+                "wal_rate_bytes_per_sec",
+                row.get_by_name::<i64, _>("wal_rate_bytes_per_sec"),
+            )?;
+            let wal_burst_bytes = required_policy_field(
+                "wal_burst_bytes",
+                row.get_by_name::<i64, _>("wal_burst_bytes"),
+            )?;
+
+            policies.push(CachedEffectivePolicy {
+                scope_kind: ScopeKind::parse_sql(&scope_kind)?,
+                scope_value: normalize_scope_value(scope_value.as_deref()),
+                policy: EffectivePolicy {
+                    policy_id,
+                    enabled,
+                    mode: BudgetMode::parse_sql(&mode)?,
+                    wal_rate_bytes_per_sec: validate_positive_wal_bytes(
+                        "wal_rate_bytes_per_sec",
+                        wal_rate_bytes_per_sec,
+                    )?,
+                    wal_burst_bytes: validate_positive_wal_bytes(
+                        "wal_burst_bytes",
+                        wal_burst_bytes,
+                    )?,
+                },
             });
         }
         Ok(policies)
-    })
-    .map_err(spi_error)?;
-
-    let mut policies = Vec::with_capacity(raw_policies.len());
-    for raw_policy in raw_policies {
-        policies.push(decode_cached_policy(raw_policy)?);
-    }
+    })?;
 
     Ok(PolicyCache {
         refreshed_epoch_ms: now_epoch_ms,
@@ -182,48 +193,9 @@ fn policy_table_exists() -> PwbResult<bool> {
         .map_err(spi_error)
 }
 
-fn decode_cached_policy(raw_policy: RawEffectivePolicy) -> PwbResult<CachedEffectivePolicy> {
-    let policy_id = raw_policy.policy_id.ok_or_else(|| PwbError::Internal {
-        message: "effective policy row is missing policy_id".to_string(),
-    })?;
-    let scope_kind = raw_policy
-        .scope_kind
-        .ok_or_else(|| PwbError::Internal {
-            message: "effective policy row is missing scope_kind".to_string(),
-        })
-        .and_then(|scope_kind| ScopeKind::parse_sql(&scope_kind))?;
-    let enabled = raw_policy.enabled.ok_or_else(|| PwbError::Internal {
-        message: "effective policy row is missing enabled".to_string(),
-    })?;
-    let mode = raw_policy
-        .mode
-        .ok_or_else(|| PwbError::Internal {
-            message: "effective policy row is missing mode".to_string(),
-        })
-        .and_then(|mode| BudgetMode::parse_sql(&mode))?;
-    let wal_rate_bytes_per_sec = raw_policy
-        .wal_rate_bytes_per_sec
-        .ok_or_else(|| PwbError::Internal {
-            message: "effective policy row is missing wal_rate_bytes_per_sec".to_string(),
-        })
-        .and_then(|value| validate_positive_wal_bytes("wal_rate_bytes_per_sec", value))?;
-    let wal_burst_bytes = raw_policy
-        .wal_burst_bytes
-        .ok_or_else(|| PwbError::Internal {
-            message: "effective policy row is missing wal_burst_bytes".to_string(),
-        })
-        .and_then(|value| validate_positive_wal_bytes("wal_burst_bytes", value))?;
-
-    Ok(CachedEffectivePolicy {
-        scope_kind,
-        scope_value: normalize_scope_value(raw_policy.scope_value.as_deref()),
-        policy: EffectivePolicy {
-            policy_id,
-            enabled,
-            mode,
-            wal_rate_bytes_per_sec,
-            wal_burst_bytes,
-        },
+fn required_policy_field<T>(field: &'static str, value: spi::SpiResult<Option<T>>) -> PwbResult<T> {
+    value.map_err(spi_error)?.ok_or_else(|| PwbError::Internal {
+        message: format!("effective policy row is missing {field}"),
     })
 }
 

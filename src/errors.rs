@@ -56,6 +56,19 @@ impl PwbError {
         }
     }
 
+    pub(crate) const fn sql_error_code(&self) -> PgSqlErrorCode {
+        match self {
+            Self::InvalidBudgetMode { .. }
+            | Self::InvalidScopeKind { .. }
+            | Self::InvalidPolicyValue { .. } => PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+            Self::InsufficientPrivilege { .. } => PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
+            Self::MissingScope
+            | Self::PredictionUnavailable { .. }
+            | Self::BudgetExceeded { .. } => PgSqlErrorCode::ERRCODE_RAISE_EXCEPTION,
+            Self::Internal { .. } => PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+        }
+    }
+
     pub(crate) const fn message(&self) -> &'static str {
         match self {
             Self::InvalidBudgetMode { .. }
@@ -78,19 +91,14 @@ impl PwbError {
 pub(crate) fn raise<T>(error: PwbError) -> T {
     let message = error.message();
     let detail = error.to_string();
-    let sqlstate = sqlstate_to_error_code(error.sqlstate());
+    let sql_error_code = error.sql_error_code();
 
-    ereport!(PgLogLevel::ERROR, sqlstate, format!("{message}: {detail}"));
+    ereport!(
+        PgLogLevel::ERROR,
+        sql_error_code,
+        format!("{message}: {detail}")
+    );
     unreachable!("ereport(ERROR) should not return");
-}
-
-const fn sqlstate_to_error_code(sqlstate: &str) -> PgSqlErrorCode {
-    match sqlstate.as_bytes() {
-        b"22023" => PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
-        b"42501" => PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
-        b"XX000" => PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
-        _ => PgSqlErrorCode::ERRCODE_RAISE_EXCEPTION,
-    }
 }
 
 impl fmt::Display for PwbError {
@@ -148,6 +156,10 @@ mod tests {
 
         assert_eq!(error.sqlstate(), WAL_BUDGET_EXCEEDED_SQLSTATE);
         assert_eq!(
+            error.sql_error_code(),
+            PgSqlErrorCode::ERRCODE_RAISE_EXCEPTION
+        );
+        assert_eq!(
             error.message(),
             "pg_wal_budget rejected statement: WAL budget exceeded"
         );
@@ -160,6 +172,10 @@ mod tests {
         };
 
         assert_eq!(error.sqlstate(), INVALID_PARAMETER_SQLSTATE);
+        assert_eq!(
+            error.sql_error_code(),
+            PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE
+        );
         assert_eq!(error.message(), "invalid pg_wal_budget policy value");
     }
 
@@ -171,8 +187,26 @@ mod tests {
 
         assert_eq!(error.sqlstate(), "42501");
         assert_eq!(
+            error.sql_error_code(),
+            PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE
+        );
+        assert_eq!(
             error.message(),
             "insufficient privilege for pg_wal_budget operation"
         );
+    }
+
+    #[test]
+    fn internal_errors_use_internal_error_code() {
+        let error = PwbError::Internal {
+            message: "shared memory unavailable".to_string(),
+        };
+
+        assert_eq!(error.sqlstate(), INTERNAL_ERROR_SQLSTATE);
+        assert_eq!(
+            error.sql_error_code(),
+            PgSqlErrorCode::ERRCODE_INTERNAL_ERROR
+        );
+        assert_eq!(error.message(), "pg_wal_budget internal error");
     }
 }
