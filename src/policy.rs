@@ -8,6 +8,7 @@ use pgrx::spi;
 use crate::budget::EffectivePolicy;
 use crate::errors::{self, PwbError, PwbResult};
 use crate::hooks;
+use crate::privileges::{self, PrivilegeGate};
 use crate::time;
 use crate::types::{BudgetMode, EpochMillis, PolicyId, ScopeKey, ScopeKind, WalBytes};
 
@@ -226,6 +227,8 @@ fn pwb_create_policy(
     mode: default!(&str, "'observe'"),
     priority: default!(i32, "100"),
 ) -> i32 {
+    privileges::require(PrivilegeGate::Admin, "create pg_wal_budget policy")
+        .unwrap_or_else(errors::raise);
     create_policy_impl(
         scope_kind,
         scope_value,
@@ -239,11 +242,15 @@ fn pwb_create_policy(
 
 #[pg_extern]
 fn pwb_set_policy_mode(policy_id: i32, mode: &str) {
+    privileges::require(PrivilegeGate::Admin, "set pg_wal_budget policy mode")
+        .unwrap_or_else(errors::raise);
     set_policy_mode_impl(policy_id, mode).unwrap_or_else(errors::raise);
 }
 
 #[pg_extern]
 fn pwb_disable_policy(policy_id: i32) {
+    privileges::require(PrivilegeGate::Admin, "disable pg_wal_budget policy")
+        .unwrap_or_else(errors::raise);
     disable_policy_impl(policy_id).unwrap_or_else(errors::raise);
 }
 

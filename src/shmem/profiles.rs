@@ -28,7 +28,9 @@ pub(crate) fn reset_profiles() -> PwbResult<()> {
 }
 
 pub(crate) fn snapshot_query_profiles() -> PwbResult<Vec<QueryProfileSnapshot>> {
-    with_locked_state(|_state, _recent_decisions, profiles| snapshot_profiles_from_slice(profiles))
+    with_locked_state(|state, _recent_decisions, profiles| {
+        snapshot_profiles_from_slice(profiles, state.profiles_len as usize)
+    })
 }
 
 pub(crate) fn ensure_profiles_loaded(
@@ -131,7 +133,7 @@ fn reserve_profile_persist(
             return Ok(None);
         }
 
-        let snapshots = snapshot_profiles_from_slice(profiles)?;
+        let snapshots = snapshot_profiles_from_slice(profiles, state.profiles_len as usize)?;
         state.last_profile_persist_epoch_ms = now_epoch_ms;
         Ok(Some(snapshots))
     })
@@ -142,7 +144,7 @@ fn snapshot_profiles_for_persist(
 ) -> PwbResult<Vec<QueryProfileSnapshot>> {
     with_locked_state(|state, _recent_decisions, profiles| {
         state.last_profile_persist_epoch_ms = now_epoch_ms;
-        snapshot_profiles_from_slice(profiles)
+        snapshot_profiles_from_slice(profiles, state.profiles_len as usize)
     })
 }
 
@@ -160,15 +162,23 @@ pub(crate) fn lookup_scoped_or_global_query_profile(
     query_id: QueryId,
 ) -> PwbResult<Option<QueryWalProfile>> {
     with_locked_state(|_state, _recent_decisions, profiles| {
-        if let Some(slot) = find_profile_slot(profiles, Some(scope_hash), query_id) {
-            return Ok(Some(profiles[slot].profile.into()));
+        let mut global_profile = None;
+
+        for profile in profiles.iter().filter(|profile| profile.occupied == 1) {
+            if profile.query_id != query_id {
+                continue;
+            }
+
+            if profile.has_scope_hash == 1 && profile.scope_hash == scope_hash {
+                return Ok(Some(profile.profile.into()));
+            }
+
+            if profile.has_scope_hash == 0 && global_profile.is_none() {
+                global_profile = Some(profile.profile.into());
+            }
         }
 
-        let Some(slot) = find_profile_slot(profiles, None, query_id) else {
-            return Ok(None);
-        };
-
-        Ok(Some(profiles[slot].profile.into()))
+        Ok(global_profile)
     })
 }
 
@@ -309,8 +319,9 @@ fn upsert_restored_query_profile_locked(
 
 fn snapshot_profiles_from_slice(
     profiles: &[PwbProfileEntry],
+    occupied_len: usize,
 ) -> PwbResult<Vec<QueryProfileSnapshot>> {
-    let mut snapshots = Vec::new();
+    let mut snapshots = Vec::with_capacity(occupied_len.min(profiles.len()));
 
     for profile in profiles.iter().filter(|profile| profile.occupied == 1) {
         let decoded = profile.decode()?;
@@ -377,7 +388,7 @@ mod tests {
         ];
 
         let snapshots =
-            snapshot_profiles_from_slice(&profiles).unwrap_or_else(|error| panic!("{error}"));
+            snapshot_profiles_from_slice(&profiles, 2).unwrap_or_else(|error| panic!("{error}"));
 
         assert_eq!(snapshots.len(), 2);
         assert_eq!(snapshots[0].scope_hash, Some(99));

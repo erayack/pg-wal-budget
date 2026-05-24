@@ -5,7 +5,9 @@ use super::records::{BudgetBucketSnapshot, BudgetBucketState, PwbBudgetBucket, P
 use super::{budget_bucket_capacity_exhausted, with_locked_bucket_state};
 
 pub(crate) fn snapshot_budget_buckets() -> PwbResult<Vec<BudgetBucketSnapshot>> {
-    with_locked_bucket_state(|_state, buckets| snapshot_budget_buckets_from_slice(buckets))
+    with_locked_bucket_state(|state, buckets| {
+        snapshot_budget_buckets_from_slice(buckets, state.budget_buckets_len as usize)
+    })
 }
 
 pub(crate) fn with_budget_bucket<R>(
@@ -44,19 +46,26 @@ fn apply_budget_bucket<R>(
     initializer: impl FnOnce() -> BudgetBucketState,
     callback: impl FnOnce(&mut BudgetBucketState) -> PwbResult<R>,
 ) -> PwbResult<R> {
-    if buckets.is_empty() {
+    let mut first_empty_slot = None;
+
+    for (slot, bucket) in buckets.iter().enumerate() {
+        if bucket.occupied == 1 && bucket.policy_id == policy_id && bucket.scope_hash == scope_hash
+        {
+            let mut bucket = bucket.state();
+            let result = callback(&mut bucket)?;
+            buckets[slot] = PwbBudgetBucket::encode(bucket);
+            return Ok(result);
+        }
+
+        if bucket.occupied == 0 && first_empty_slot.is_none() {
+            first_empty_slot = Some(slot);
+        }
+    }
+
+    let Some(slot) = first_empty_slot else {
         return Err(budget_bucket_capacity_exhausted());
-    }
+    };
 
-    if let Some(slot) = find_budget_bucket_slot(buckets, policy_id, scope_hash) {
-        let mut bucket = buckets[slot].state();
-        let result = callback(&mut bucket)?;
-        buckets[slot] = PwbBudgetBucket::encode(bucket);
-        return Ok(result);
-    }
-
-    let slot =
-        find_empty_budget_bucket_slot(buckets).ok_or_else(budget_bucket_capacity_exhausted)?;
     let mut bucket = initializer();
     let result = callback(&mut bucket)?;
     buckets[slot] = PwbBudgetBucket::encode(bucket);
@@ -69,8 +78,9 @@ fn apply_budget_bucket<R>(
 
 fn snapshot_budget_buckets_from_slice(
     buckets: &[PwbBudgetBucket],
+    occupied_len: usize,
 ) -> PwbResult<Vec<BudgetBucketSnapshot>> {
-    let mut snapshots = Vec::new();
+    let mut snapshots = Vec::with_capacity(occupied_len.min(buckets.len()));
 
     for bucket in buckets.iter().filter(|bucket| bucket.occupied == 1) {
         let decoded = bucket.decode()?;
@@ -98,10 +108,6 @@ fn find_budget_bucket_slot(
     })
 }
 
-fn find_empty_budget_bucket_slot(buckets: &[PwbBudgetBucket]) -> Option<usize> {
-    buckets.iter().position(|bucket| bucket.occupied == 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,8 +129,8 @@ mod tests {
             PwbBudgetBucket::default(),
         ];
 
-        let snapshots =
-            snapshot_budget_buckets_from_slice(&buckets).unwrap_or_else(|error| panic!("{error}"));
+        let snapshots = snapshot_budget_buckets_from_slice(&buckets, 1)
+            .unwrap_or_else(|error| panic!("{error}"));
 
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].policy_id, 7);

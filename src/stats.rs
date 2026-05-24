@@ -1,8 +1,8 @@
 use pgrx::iter::TableIterator;
 use pgrx::prelude::*;
 
-use crate::errors::{self, PwbError, PwbResult};
-use crate::privileges::{self, ADMIN_ROLE};
+use crate::errors::{self, PwbResult};
+use crate::privileges::{self, PrivilegeGate};
 use crate::profile;
 use crate::profile_store;
 use crate::shmem::{
@@ -145,32 +145,35 @@ fn pwb_recent_decisions(
 
 #[pg_extern]
 fn pwb_reset_stats() {
+    privileges::require(PrivilegeGate::Admin, "reset pg_wal_budget stats")
+        .unwrap_or_else(errors::raise);
     reset_stats_impl().unwrap_or_else(errors::raise);
 }
 
 #[pg_extern]
 fn pwb_reset_profiles() {
+    privileges::require(PrivilegeGate::Admin, "reset pg_wal_budget query profiles")
+        .unwrap_or_else(errors::raise);
     reset_profiles_impl().unwrap_or_else(errors::raise);
 }
 
 #[pg_extern]
 fn pwb_flush_profiles() {
+    privileges::require(PrivilegeGate::Admin, "flush pg_wal_budget query profiles")
+        .unwrap_or_else(errors::raise);
     flush_profiles_impl().unwrap_or_else(errors::raise);
 }
 
 fn reset_stats_impl() -> PwbResult<()> {
-    require_admin("reset pg_wal_budget stats")?;
     shmem::reset_stats()
 }
 
 fn reset_profiles_impl() -> PwbResult<()> {
-    require_admin("reset pg_wal_budget query profiles")?;
     profile_store::delete_profiles()?;
     shmem::reset_profiles()
 }
 
 fn flush_profiles_impl() -> PwbResult<()> {
-    require_admin("flush pg_wal_budget query profiles")?;
     profile::flush_profiles()
 }
 
@@ -228,14 +231,6 @@ fn recent_decision_row(record: RecentDecisionRecord) -> RecentDecisionRow {
         wal_bytes_to_i64_saturating(record.available_after),
         record.reason_code.as_sql_str(),
     )
-}
-
-fn require_admin(operation: &'static str) -> PwbResult<()> {
-    if privileges::current_user_is_superuser_or_member_of(&[ADMIN_ROLE])? {
-        Ok(())
-    } else {
-        Err(PwbError::InsufficientPrivilege { operation })
-    }
 }
 
 const fn wal_bytes_to_i64_saturating(value: WalBytes) -> i64 {

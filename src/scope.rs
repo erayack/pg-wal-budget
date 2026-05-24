@@ -5,7 +5,7 @@ use pgrx::pg_sys;
 use pgrx::prelude::*;
 
 use crate::errors::{self, PwbError, PwbResult};
-use crate::privileges::{self, ADMIN_ROLE, TENANT_SETTER_ROLE};
+use crate::privileges::{self, PrivilegeGate};
 use crate::types::{ScopeHash, ScopeKey, ScopeKind};
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -23,12 +23,16 @@ pub(crate) struct BackendScopeState {
 
 #[pg_extern]
 fn pwb_set_tenant(tenant: &str) {
+    privileges::require(PrivilegeGate::TenantSetter, "set trusted tenant scope")
+        .unwrap_or_else(errors::raise);
     set_tenant_impl(tenant).unwrap_or_else(errors::raise);
 }
 
 #[pg_extern]
 fn pwb_clear_tenant() {
-    clear_tenant_impl().unwrap_or_else(errors::raise);
+    privileges::require(PrivilegeGate::TenantSetter, "clear trusted tenant scope")
+        .unwrap_or_else(errors::raise);
+    clear_tenant_impl();
 }
 
 pub(crate) fn classify_current_scope() -> PwbResult<ScopeKey> {
@@ -56,7 +60,6 @@ pub(crate) fn current_tenant() -> Option<String> {
 }
 
 fn set_tenant_impl(tenant: &str) -> PwbResult<()> {
-    require_tenant_setter_privilege()?;
     let tenant = normalize_tenant_value(tenant)?;
     let scope_hash = hash_scope_value(ScopeKind::Tenant, &tenant);
 
@@ -69,26 +72,12 @@ fn set_tenant_impl(tenant: &str) -> PwbResult<()> {
     Ok(())
 }
 
-fn clear_tenant_impl() -> PwbResult<()> {
-    require_tenant_setter_privilege()?;
-
+fn clear_tenant_impl() {
     BACKEND_SCOPE_STATE.with(|state| {
         let mut state = state.borrow_mut();
         state.tenant = None;
         state.last_scope_hash = None;
     });
-
-    Ok(())
-}
-
-fn require_tenant_setter_privilege() -> PwbResult<()> {
-    if privileges::current_user_is_superuser_or_member_of(&[ADMIN_ROLE, TENANT_SETTER_ROLE])? {
-        return Ok(());
-    }
-
-    Err(PwbError::InsufficientPrivilege {
-        operation: "set or clear trusted tenant scope",
-    })
 }
 
 fn normalize_tenant_value(tenant: &str) -> PwbResult<String> {
