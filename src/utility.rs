@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::ffi::CStr;
 
 use pgrx::pg_sys;

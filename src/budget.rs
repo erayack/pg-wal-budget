@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::errors::{PwbError, PwbResult};
 use crate::shmem::{self, BudgetBucketState};
 use crate::types::{
@@ -250,7 +248,11 @@ mod tests {
     fn context(predicted_wal_bytes: WalBytes) -> AdmissionContext {
         AdmissionContext {
             query_id: None,
-            scope: ScopeKey::new(ScopeKind::Tenant, SCOPE_HASH),
+            scope: ScopeKey {
+                kind: ScopeKind::Tenant,
+                value_hash: SCOPE_HASH,
+                debug_value: None,
+            },
             statement_class: StatementClass::Write,
             predicted_wal_bytes,
         }

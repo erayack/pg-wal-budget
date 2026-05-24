@@ -99,37 +99,30 @@ pub(crate) fn register_gucs() {
     );
 }
 
-#[allow(dead_code)]
 pub(crate) fn enabled() -> bool {
     ENABLED.get()
 }
 
-#[allow(dead_code)]
 pub(crate) fn fail_open() -> bool {
     FAIL_OPEN.get()
 }
 
-#[allow(dead_code)]
 pub(crate) fn default_write_wal_bytes() -> WalBytes {
     nonnegative_i32_to_wal_bytes(DEFAULT_WRITE_WAL_BYTES.get())
 }
 
-#[allow(dead_code)]
 pub(crate) fn default_utility_wal_bytes() -> WalBytes {
     nonnegative_i32_to_wal_bytes(DEFAULT_UTILITY_WAL_BYTES.get())
 }
 
-#[allow(dead_code)]
 pub(crate) fn max_prediction_bytes() -> WalBytes {
     nonnegative_i32_to_wal_bytes(MAX_PREDICTION_BYTES.get())
 }
 
-#[allow(dead_code)]
 pub(crate) fn shmem_capacity() -> usize {
     nonnegative_i32_to_usize(SHMEM_CAPACITY.get())
 }
 
-#[allow(dead_code)]
 pub(crate) fn profile_ewma_alpha_weights() -> PwbResult<ProfileEwmaWeights> {
     alpha_to_profile_ewma_weights(PROFILE_EWMA_ALPHA.get())
 }

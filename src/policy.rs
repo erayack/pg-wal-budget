@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::cell::RefCell;
 
 use pgrx::Spi;
@@ -534,7 +532,11 @@ mod tests {
                 Some("tenant-a"),
             )],
         };
-        let scope = ScopeKey::new(ScopeKind::Tenant, SCOPE_HASH);
+        let scope = ScopeKey {
+            kind: ScopeKind::Tenant,
+            value_hash: SCOPE_HASH,
+            debug_value: None,
+        };
 
         assert_eq!(find_effective_policy(&cache, &scope), None);
     }

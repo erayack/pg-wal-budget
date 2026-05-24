@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::errors::PwbResult;
 use crate::guc;
 use crate::profile_store;
@@ -44,19 +42,6 @@ fn lookup_prediction_profile(
     let profile = shmem::lookup_scoped_or_global_query_profile(scope_hash, query_id)?;
     let _ = maybe_persist_profiles(time::current_epoch_ms());
     Ok(profile)
-}
-
-pub(crate) fn record_observation(
-    scope_hash: ScopeHash,
-    query_id: Option<QueryId>,
-    actual_wal_bytes: WalBytes,
-    now_epoch_ms: EpochMillis,
-) -> PwbResult<()> {
-    let Some(query_id) = query_id else {
-        return Ok(());
-    };
-
-    record_query_observation(scope_hash, query_id, actual_wal_bytes, now_epoch_ms)
 }
 
 pub(crate) fn record_query_observation(
@@ -178,10 +163,5 @@ mod tests {
     #[test]
     fn lookup_without_query_id_does_not_require_shared_memory() {
         assert_eq!(lookup_prediction_profile(99, None), Ok(None));
-    }
-
-    #[test]
-    fn record_without_query_id_is_a_noop() {
-        assert_eq!(record_observation(99, None, 1024, 123), Ok(()));
     }
 }

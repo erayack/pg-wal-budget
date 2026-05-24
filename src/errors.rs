@@ -1,14 +1,8 @@
-#![allow(dead_code)]
-
 use core::fmt;
 
 use pgrx::{PgLogLevel, PgSqlErrorCode, ereport};
 
-use crate::types::{PolicyId, StatementClass, WalBytes};
-
-pub(crate) const WAL_BUDGET_EXCEEDED_SQLSTATE: &str = "P0001";
-pub(crate) const INVALID_PARAMETER_SQLSTATE: &str = "22023";
-pub(crate) const INTERNAL_ERROR_SQLSTATE: &str = "XX000";
+use crate::types::{PolicyId, WalBytes};
 
 pub(crate) type PwbResult<T> = Result<T, PwbError>;
 
@@ -29,9 +23,6 @@ pub(crate) enum PwbError {
         operation: &'static str,
     },
     MissingScope,
-    PredictionUnavailable {
-        statement_class: StatementClass,
-    },
     BudgetExceeded {
         policy_id: PolicyId,
         predicted_wal_bytes: WalBytes,
@@ -43,28 +34,15 @@ pub(crate) enum PwbError {
 }
 
 impl PwbError {
-    pub(crate) const fn sqlstate(&self) -> &'static str {
-        match self {
-            Self::InvalidBudgetMode { .. }
-            | Self::InvalidScopeKind { .. }
-            | Self::InvalidPolicyValue { .. } => INVALID_PARAMETER_SQLSTATE,
-            Self::InsufficientPrivilege { .. } => "42501",
-            Self::MissingScope
-            | Self::PredictionUnavailable { .. }
-            | Self::BudgetExceeded { .. } => WAL_BUDGET_EXCEEDED_SQLSTATE,
-            Self::Internal { .. } => INTERNAL_ERROR_SQLSTATE,
-        }
-    }
-
     pub(crate) const fn sql_error_code(&self) -> PgSqlErrorCode {
         match self {
             Self::InvalidBudgetMode { .. }
             | Self::InvalidScopeKind { .. }
             | Self::InvalidPolicyValue { .. } => PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
             Self::InsufficientPrivilege { .. } => PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
-            Self::MissingScope
-            | Self::PredictionUnavailable { .. }
-            | Self::BudgetExceeded { .. } => PgSqlErrorCode::ERRCODE_RAISE_EXCEPTION,
+            Self::MissingScope | Self::BudgetExceeded { .. } => {
+                PgSqlErrorCode::ERRCODE_RAISE_EXCEPTION
+            }
             Self::Internal { .. } => PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
         }
     }
@@ -78,9 +56,6 @@ impl PwbError {
                 "insufficient privilege for pg_wal_budget operation"
             }
             Self::MissingScope => "pg_wal_budget could not determine statement scope",
-            Self::PredictionUnavailable { .. } => {
-                "pg_wal_budget could not predict statement WAL usage"
-            }
             Self::BudgetExceeded { .. } => "pg_wal_budget rejected statement: WAL budget exceeded",
             Self::Internal { .. } => "pg_wal_budget internal error",
         }
@@ -122,11 +97,6 @@ impl fmt::Display for PwbError {
                 write!(formatter, "insufficient privilege to {operation}")
             }
             Self::MissingScope => formatter.write_str("missing scope"),
-            Self::PredictionUnavailable { statement_class } => write!(
-                formatter,
-                "prediction unavailable for statement class {}",
-                statement_class.as_sql_str()
-            ),
             Self::BudgetExceeded {
                 policy_id,
                 predicted_wal_bytes,
@@ -154,7 +124,6 @@ mod tests {
             available_wal_bytes: 512,
         };
 
-        assert_eq!(error.sqlstate(), WAL_BUDGET_EXCEEDED_SQLSTATE);
         assert_eq!(
             error.sql_error_code(),
             PgSqlErrorCode::ERRCODE_RAISE_EXCEPTION
@@ -166,12 +135,11 @@ mod tests {
     }
 
     #[test]
-    fn invalid_policy_values_use_invalid_parameter_sqlstate() {
+    fn invalid_policy_values_use_invalid_parameter_error_code() {
         let error = PwbError::InvalidBudgetMode {
             value: "enforce".to_string(),
         };
 
-        assert_eq!(error.sqlstate(), INVALID_PARAMETER_SQLSTATE);
         assert_eq!(
             error.sql_error_code(),
             PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE
@@ -180,12 +148,11 @@ mod tests {
     }
 
     #[test]
-    fn insufficient_privilege_uses_privilege_sqlstate() {
+    fn insufficient_privilege_uses_privilege_error_code() {
         let error = PwbError::InsufficientPrivilege {
             operation: "set trusted tenant scope",
         };
 
-        assert_eq!(error.sqlstate(), "42501");
         assert_eq!(
             error.sql_error_code(),
             PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE
@@ -202,7 +169,6 @@ mod tests {
             message: "shared memory unavailable".to_string(),
         };
 
-        assert_eq!(error.sqlstate(), INTERNAL_ERROR_SQLSTATE);
         assert_eq!(
             error.sql_error_code(),
             PgSqlErrorCode::ERRCODE_INTERNAL_ERROR

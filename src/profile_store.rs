@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use pgrx::datum::DatumWithOid;
 use pgrx::{Spi, spi};
 

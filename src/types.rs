@@ -1,9 +1,6 @@
-#![allow(dead_code)]
-
 use crate::errors::{PwbError, PwbResult};
 
 pub(crate) type WalBytes = u64;
-pub(crate) type BudgetTokens = u64;
 pub(crate) type QueryId = u64;
 pub(crate) type ScopeHash = u64;
 pub(crate) type PolicyId = i32;
@@ -116,10 +113,6 @@ impl StatementClass {
             Self::Unknown => "unknown",
         }
     }
-
-    pub(crate) const fn is_wal_generating_candidate(self) -> bool {
-        !matches!(self, Self::ReadOnly)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -161,14 +154,6 @@ pub(crate) struct ScopeKey {
 }
 
 impl ScopeKey {
-    pub(crate) const fn new(kind: ScopeKind, value_hash: ScopeHash) -> Self {
-        Self {
-            kind,
-            value_hash,
-            debug_value: None,
-        }
-    }
-
     pub(crate) fn with_debug_value(
         kind: ScopeKind,
         value_hash: ScopeHash,
@@ -265,17 +250,6 @@ impl AdmissionDecision {
             available_before: 0,
             available_after: 0,
             reason_code: ReasonCode::NoMatchingPolicy,
-        }
-    }
-
-    pub(crate) const fn missing_scope() -> Self {
-        Self {
-            kind: DecisionKind::MissingScope,
-            policy_id: None,
-            charged_bytes: 0,
-            available_before: 0,
-            available_after: 0,
-            reason_code: ReasonCode::MissingScope,
         }
     }
 
@@ -414,15 +388,6 @@ mod tests {
         assert_eq!(ScopeKind::Application.as_sql_str(), "application");
         assert_eq!(ScopeKind::Tenant.as_sql_str(), "tenant");
         assert_eq!(ScopeKind::Composite.as_sql_str(), "composite");
-    }
-
-    #[test]
-    fn classifies_wal_generating_statement_candidates() {
-        assert!(!StatementClass::ReadOnly.is_wal_generating_candidate());
-        assert!(StatementClass::Write.is_wal_generating_candidate());
-        assert!(StatementClass::Utility.is_wal_generating_candidate());
-        assert!(StatementClass::Copy.is_wal_generating_candidate());
-        assert!(StatementClass::Unknown.is_wal_generating_candidate());
     }
 
     #[test]

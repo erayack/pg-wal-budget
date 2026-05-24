@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::cell::RefCell;
 use std::ffi::CStr;
 
@@ -55,10 +53,6 @@ pub(crate) fn classify_current_scope() -> PwbResult<ScopeKey> {
 
 pub(crate) fn current_tenant() -> Option<String> {
     BACKEND_SCOPE_STATE.with(|state| state.borrow().tenant.clone())
-}
-
-pub(crate) fn last_scope_hash() -> Option<ScopeHash> {
-    BACKEND_SCOPE_STATE.with(|state| state.borrow().last_scope_hash)
 }
 
 fn set_tenant_impl(tenant: &str) -> PwbResult<()> {
@@ -234,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn clearing_tenant_state_clears_last_scope_hash() {
+    fn clearing_tenant_state_clears_backend_scope_state() {
         BACKEND_SCOPE_STATE.with(|state| {
             let mut state = state.borrow_mut();
             state.tenant = Some("tenant-a".to_string());
@@ -248,6 +242,8 @@ mod tests {
         });
 
         assert_eq!(current_tenant(), None);
-        assert_eq!(last_scope_hash(), None);
+        BACKEND_SCOPE_STATE.with(|state| {
+            assert_eq!(state.borrow().last_scope_hash, None);
+        });
     }
 }
