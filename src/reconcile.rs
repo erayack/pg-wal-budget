@@ -23,7 +23,6 @@ struct ChargedStatement {
     scope_hash: ScopeHash,
     charged_bytes: WalBytes,
     query_id: Option<QueryId>,
-    measurement_kind: WalMeasurementKind,
     is_allowed: bool,
 }
 
@@ -34,17 +33,8 @@ impl ChargedStatement {
             scope_hash: statement.scope_hash,
             charged_bytes: statement.decision.charged_bytes,
             query_id: statement.query_id,
-            measurement_kind: statement.measurement_kind,
             is_allowed: matches!(statement.decision.kind, DecisionKind::Allowed),
         }
-    }
-
-    const fn is_exact(self) -> bool {
-        matches!(self.measurement_kind, WalMeasurementKind::ExactBackend)
-    }
-
-    const fn has_query_id(self) -> bool {
-        self.query_id.is_some()
     }
 
     const fn charged_policy_id(self) -> Option<i32> {
@@ -60,9 +50,6 @@ pub(crate) fn capture_start(mut statement: ActiveStatementState) -> ActiveStatem
     if let Some(wal_bytes) = current_backend_wal_bytes() {
         statement.start_wal_bytes = Some(wal_bytes);
         statement.measurement_kind = WalMeasurementKind::ExactBackend;
-    } else if let Some(lsn) = current_wal_insert_lsn() {
-        statement.start_wal_bytes = Some(lsn);
-        statement.measurement_kind = WalMeasurementKind::ApproximateInsertLsn;
     } else {
         statement.start_wal_bytes = None;
         statement.measurement_kind = WalMeasurementKind::Unavailable;
@@ -76,7 +63,7 @@ pub(crate) fn reconcile_completed_statement(statement: &ActiveStatementState) {
         admission::record_missing_actual_wal();
         return;
     };
-    let Some(end_wal_bytes) = current_measurement_for_kind(statement.measurement_kind) else {
+    let Some(end_wal_bytes) = current_backend_wal_bytes() else {
         admission::record_missing_actual_wal();
         return;
     };
@@ -84,7 +71,7 @@ pub(crate) fn reconcile_completed_statement(statement: &ActiveStatementState) {
     let actual_wal_bytes = wal_delta(start_wal_bytes, end_wal_bytes);
     let now_epoch_ms = time::current_epoch_ms();
     let charge = ChargedStatement::from_active(statement);
-    let debt_bytes = if charge.is_exact() && charge.charged_policy_id().is_some() {
+    let debt_bytes = if charge.charged_policy_id().is_some() {
         exact_reconciliation_debt_bytes(charge, actual_wal_bytes)
     } else {
         0
@@ -115,10 +102,7 @@ pub(crate) fn reconcile_completed_statement(statement: &ActiveStatementState) {
         reason_code: statement.decision.reason_code,
     }));
 
-    if charge.is_exact()
-        && charge.has_query_id()
-        && let Some(query_id) = charge.query_id
-    {
+    if let Some(query_id) = charge.query_id {
         record_reconciliation_result(&profile::record_query_observation(
             charge.scope_hash,
             query_id,
@@ -127,7 +111,7 @@ pub(crate) fn reconcile_completed_statement(statement: &ActiveStatementState) {
         ));
     }
 
-    if charge.is_exact() && charge.charged_policy_id().is_some() {
+    if charge.charged_policy_id().is_some() {
         record_reconciliation_result(&reconcile_budget(charge, actual_wal_bytes));
     }
 }
@@ -196,26 +180,6 @@ const fn budget_reconciliation(
     }
 }
 
-fn current_wal_insert_lsn() -> Option<WalBytes> {
-    // SAFETY: These PostgreSQL WAL accessors are read-only and are called from a live backend
-    // during hook execution. XLogInsertAllowed guards contexts where insert WAL state is not usable.
-    unsafe {
-        if !pg_sys::XLogInsertAllowed() {
-            return None;
-        }
-
-        Some(pg_sys::GetXLogInsertRecPtr() as WalBytes)
-    }
-}
-
-fn current_measurement_for_kind(kind: WalMeasurementKind) -> Option<WalBytes> {
-    match kind {
-        WalMeasurementKind::ExactBackend => current_backend_wal_bytes(),
-        WalMeasurementKind::ApproximateInsertLsn => current_wal_insert_lsn(),
-        WalMeasurementKind::Unavailable => None,
-    }
-}
-
 #[cfg(feature = "pg17")]
 #[allow(clippy::unnecessary_wraps)]
 fn current_backend_wal_bytes() -> Option<WalBytes> {
@@ -227,7 +191,7 @@ fn current_backend_wal_bytes() -> Option<WalBytes> {
 
 #[cfg(not(feature = "pg17"))]
 const fn current_backend_wal_bytes() -> Option<WalBytes> {
-    // Keep the optional return type so unsupported targets can fall back to insert-LSN telemetry.
+    // Keep the optional return type so unsupported targets report unavailable measurement.
     None
 }
 
@@ -260,14 +224,13 @@ mod tests {
     }
 
     #[test]
-    fn charged_statement_exposes_exact_charged_allowed_predicates() {
+    fn charged_statement_exposes_charged_allowed_predicates() {
         let mut statement = test_statement(AdmissionDecision::allowed(
             Some(7),
             100,
             ReasonCode::BudgetAvailable,
         ));
         let charge = ChargedStatement::from_active(&statement);
-        assert!(charge.is_exact());
         assert_eq!(charge.charged_policy_id(), Some(7));
         assert_eq!(charge.scope_hash, statement.scope_hash);
         assert_eq!(charge.charged_bytes, 100);
@@ -283,12 +246,6 @@ mod tests {
             ChargedStatement::from_active(&statement).charged_policy_id(),
             None
         );
-
-        statement.decision = AdmissionDecision::allowed(Some(7), 100, ReasonCode::BudgetAvailable);
-        statement.measurement_kind = WalMeasurementKind::ApproximateInsertLsn;
-        let charge = ChargedStatement::from_active(&statement);
-        assert!(!charge.is_exact());
-        assert_eq!(charge.charged_policy_id(), Some(7));
     }
 
     #[test]
@@ -298,8 +255,6 @@ mod tests {
             100,
             ReasonCode::BudgetAvailable,
         ));
-        statement.measurement_kind = WalMeasurementKind::ApproximateInsertLsn;
-
         assert_eq!(
             ChargedStatement::from_active(&statement),
             ChargedStatement {
@@ -307,7 +262,6 @@ mod tests {
                 scope_hash: statement.scope_hash,
                 charged_bytes: 100,
                 query_id: Some(42),
-                measurement_kind: WalMeasurementKind::ApproximateInsertLsn,
                 is_allowed: true,
             }
         );
@@ -332,37 +286,27 @@ mod tests {
     }
 
     #[test]
-    fn profile_observations_require_exact_measurement_and_query_id() {
+    fn charged_statement_tracks_query_id() {
         let mut statement = test_statement(AdmissionDecision::allowed(
             Some(7),
             100,
             ReasonCode::BudgetAvailable,
         ));
         let charge = ChargedStatement::from_active(&statement);
-        assert!(charge.is_exact());
-        assert!(charge.has_query_id());
         assert_eq!(charge.query_id, Some(42));
 
-        statement.measurement_kind = WalMeasurementKind::ApproximateInsertLsn;
-        let charge = ChargedStatement::from_active(&statement);
-        assert!(!charge.is_exact());
-        assert!(charge.has_query_id());
-
-        statement.measurement_kind = WalMeasurementKind::ExactBackend;
         statement.query_id = None;
         let charge = ChargedStatement::from_active(&statement);
-        assert!(charge.is_exact());
-        assert!(!charge.has_query_id());
+        assert_eq!(charge.query_id, None);
     }
 
     #[test]
-    fn budget_reconciliation_refunds_or_records_debt_only_for_exact_charges() {
+    fn budget_reconciliation_refunds_or_records_debt_for_charges() {
         let charge = ChargedStatement {
             policy_id: Some(7),
             scope_hash: 99,
             charged_bytes: 100,
             query_id: Some(42),
-            measurement_kind: WalMeasurementKind::ExactBackend,
             is_allowed: true,
         };
 

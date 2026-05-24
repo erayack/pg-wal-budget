@@ -223,7 +223,6 @@ pub(crate) enum ActiveStatementOrigin {
 pub(crate) enum WalMeasurementKind {
     /// Exact per-backend WAL accounting from the backend-local WAL usage accumulator.
     ExactBackend,
-    ApproximateInsertLsn,
     Unavailable,
 }
 
