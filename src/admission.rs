@@ -4,8 +4,8 @@ use crate::policy;
 use crate::shmem::{self, CounterDelta, RecentDecisionRecord};
 use crate::time;
 use crate::types::{
-    ActiveStatementOrigin, ActiveStatementState, AdmissionContext, AdmissionDecision, DecisionKind,
-    EpochMillis, ScopeKind, StatementClass, WalBytes, WalMeasurementKind,
+    ActiveStatementState, AdmissionContext, AdmissionDecision, DecisionKind, EpochMillis,
+    ScopeKind, StatementClass, WalBytes, WalMeasurementKind,
 };
 
 #[derive(Debug)]
@@ -20,7 +20,6 @@ pub(crate) enum AdmissionError {
 
 pub(crate) fn admit_context(
     context: &AdmissionContext,
-    origin: ActiveStatementOrigin,
 ) -> Result<ActiveStatementState, AdmissionError> {
     let now_epoch_ms = time::current_epoch_ms();
 
@@ -29,13 +28,13 @@ pub(crate) fn admit_context(
     else {
         let decision = AdmissionDecision::no_matching_policy();
         record_admission_decision(context, decision, now_epoch_ms);
-        return Ok(active_statement_from_context(context, origin, decision));
+        return Ok(active_statement_from_context(context, decision));
     };
 
     match budget::admit_statement(context, &effective_policy, now_epoch_ms) {
         Ok(decision) => {
             record_admission_decision(context, decision, now_epoch_ms);
-            Ok(active_statement_from_context(context, origin, decision))
+            Ok(active_statement_from_context(context, decision))
         }
         Err(PwbError::BudgetExceeded {
             policy_id,
@@ -84,11 +83,9 @@ pub(crate) fn record_missing_actual_wal() {
 
 const fn active_statement_from_context(
     context: &AdmissionContext,
-    origin: ActiveStatementOrigin,
     decision: AdmissionDecision,
 ) -> ActiveStatementState {
     ActiveStatementState {
-        origin,
         decision,
         start_wal_bytes: None,
         measurement_kind: WalMeasurementKind::Unavailable,

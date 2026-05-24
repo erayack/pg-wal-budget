@@ -8,9 +8,7 @@ use crate::admission::{self, AdmissionError};
 use crate::errors::{PwbError, PwbResult};
 use crate::profile;
 use crate::scope;
-use crate::types::{
-    ActiveStatementOrigin, ActiveStatementState, AdmissionContext, QueryId, StatementClass,
-};
+use crate::types::{ActiveStatementState, AdmissionContext, QueryId, StatementClass};
 
 pub(crate) fn admit_utility_statement(
     pstmt: *mut pg_sys::PlannedStmt,
@@ -33,7 +31,7 @@ pub(crate) fn admit_utility_statement(
         predicted_wal_bytes,
     };
 
-    admission::admit_context(&context, ActiveStatementOrigin::Utility).map(Some)
+    admission::admit_context(&context).map(Some)
 }
 
 #[allow(clippy::cast_ptr_alignment)]

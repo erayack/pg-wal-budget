@@ -202,7 +202,6 @@ pub(crate) struct AdmissionDecision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActiveStatementState {
-    pub(crate) origin: ActiveStatementOrigin,
     pub(crate) decision: AdmissionDecision,
     pub(crate) start_wal_bytes: Option<WalBytes>,
     pub(crate) measurement_kind: WalMeasurementKind,
@@ -211,12 +210,6 @@ pub(crate) struct ActiveStatementState {
     pub(crate) scope_hash: ScopeHash,
     pub(crate) statement_class: StatementClass,
     pub(crate) predicted_wal_bytes: WalBytes,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ActiveStatementOrigin {
-    Executor,
-    Utility,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

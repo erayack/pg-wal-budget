@@ -8,9 +8,7 @@ use crate::guc;
 use crate::profile;
 use crate::reconcile;
 use crate::scope;
-use crate::types::{
-    ActiveStatementOrigin, ActiveStatementState, AdmissionContext, QueryId, StatementClass,
-};
+use crate::types::{ActiveStatementState, AdmissionContext, QueryId, StatementClass};
 use crate::utility;
 
 static mut PREV_EXECUTOR_START_HOOK: pg_sys::ExecutorStart_hook_type = None;
@@ -77,7 +75,7 @@ unsafe extern "C-unwind" fn executor_end_hook(query_desc: *mut pg_sys::QueryDesc
         }
     }
 
-    if let Some(active_statement) = pop_active_statement(ActiveStatementOrigin::Executor) {
+    if let Some(active_statement) = pop_active_statement() {
         reconcile::reconcile_completed_statement(&active_statement);
     }
 }
@@ -141,9 +139,7 @@ unsafe extern "C-unwind" fn process_utility_hook(
         }
     }
 
-    if utility_admitted
-        && let Some(active_statement) = pop_active_statement(ActiveStatementOrigin::Utility)
-    {
+    if utility_admitted && let Some(active_statement) = pop_active_statement() {
         reconcile::reconcile_completed_statement(&active_statement);
     }
 }
@@ -198,7 +194,7 @@ fn admit_normal_statement(
         statement_class,
         predicted_wal_bytes,
     };
-    admission::admit_context(&context, ActiveStatementOrigin::Executor).map(Some)
+    admission::admit_context(&context).map(Some)
 }
 
 pub(crate) fn with_admission_bypass<R>(callback: impl FnOnce() -> R) -> R {
@@ -284,18 +280,19 @@ fn push_active_statement(statement: ActiveStatementState) {
     });
 }
 
-pub(crate) fn pop_active_statement(origin: ActiveStatementOrigin) -> Option<ActiveStatementState> {
-    ACTIVE_STATEMENTS.with(|statements| {
-        let mut statements = statements.borrow_mut();
-        let index = statements
-            .iter()
-            .rposition(|statement| statement.origin == origin)?;
-        Some(statements.remove(index))
-    })
+fn pop_active_statement() -> Option<ActiveStatementState> {
+    ACTIVE_STATEMENTS.with(|statements| statements.borrow_mut().pop())
 }
 
 fn drain_active_statements() -> Vec<ActiveStatementState> {
-    ACTIVE_STATEMENTS.with(|statements| statements.borrow_mut().drain(..).collect())
+    ACTIVE_STATEMENTS.with(|statements| {
+        let mut statements = statements.borrow_mut();
+        let mut drained = Vec::with_capacity(statements.len());
+        while let Some(statement) = statements.pop() {
+            drained.push(statement);
+        }
+        drained
+    })
 }
 
 fn admission_is_bypassed() -> bool {

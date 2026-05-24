@@ -207,9 +207,7 @@ fn record_reconciliation_result(result: &PwbResult<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{
-        ActiveStatementOrigin, AdmissionDecision, ReasonCode, ScopeKind, StatementClass,
-    };
+    use crate::types::{AdmissionDecision, ReasonCode, ScopeKind, StatementClass};
 
     #[test]
     fn computes_saturating_wal_delta() {
@@ -326,7 +324,6 @@ mod tests {
 
     fn test_statement(decision: AdmissionDecision) -> ActiveStatementState {
         ActiveStatementState {
-            origin: ActiveStatementOrigin::Executor,
             decision,
             start_wal_bytes: Some(10),
             measurement_kind: WalMeasurementKind::ExactBackend,
