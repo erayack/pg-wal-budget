@@ -59,7 +59,9 @@ select pwb.disable_policy(1);
 
 - Modes: `off`, `observe`, `shadow`, `queue`, `reject`.
 - `queue` blocks the backend before execution until enough WAL budget can be charged. If the predicted WAL bytes exceed the policy burst, the statement is rejected because it can never fit in the bucket.
+- `queue` is best-effort throttling, not FIFO scheduling. Waiting backends do not reserve future budget; they wake independently and race to charge, so frequent smaller statements can delay larger queued statements.
 - Queue waits sleep in bounded chunks and check PostgreSQL interrupts between chunks, so query cancellation is observed before the statement starts with up to roughly 100 ms of sleep latency.
+- For interactive workloads, size `wal_burst_bytes` to cover the largest statement that should be allowed to wait and set `wal_rate_bytes_per_sec` high enough for acceptable waits. Use `reject`, narrower scopes, or separate role/application policies when strict latency or fairness matters.
 - Scope kinds: `tenant`, `role`, `database`, `application`, `composite`.
 - Matching: highest `priority` wins; ties resolved by lowest `policy_id`.
 - Tenant scope is trusted backend-local state; set via `pwb.set_tenant(...)` / `pwb.clear_tenant()`. Restricted to superusers and members of `pwb_tenant_setter`.
@@ -111,6 +113,23 @@ select pg_reload_conf();
 ```
 
 To fully unload hooks and shared memory, remove `pg_wal_budget` from `shared_preload_libraries` and restart.
+
+## Upgrade Notes
+
+Version `0.2.1` updates the durable `pwb.policy` mode constraint so upgraded `0.2.0`
+installations can store `queue` policies. Upgrade with:
+
+```sql
+alter extension pg_wal_budget update to '0.2.1';
+```
+
+Before rolling back to older code or older extension SQL, change all `queue` policies to a legacy
+mode such as `reject`, `shadow`, `observe`, or `off`, then verify none remain:
+
+```sql
+update pwb.policy set mode = 'reject' where mode = 'queue';
+select count(*) from pwb.policy where mode = 'queue';
+```
 
 ## Observability
 
