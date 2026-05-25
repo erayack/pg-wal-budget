@@ -7,6 +7,7 @@ use crate::profile;
 use crate::profile_store;
 use crate::shmem::{
     self, BudgetBucketSnapshot, PwbCounters, QueryProfileSnapshot, RecentDecisionRecord,
+    ScopeNameSnapshot,
 };
 use crate::types::WalBytes;
 
@@ -23,6 +24,7 @@ type CountersRow = (
     name!(missing_actual_wal_count, i64),
     name!(internal_fail_open_count, i64),
     name!(aborted_after_charge_count, i64),
+    name!(scope_name_drop_count, i64),
 );
 
 type ScopeStatsRow = (
@@ -60,6 +62,15 @@ type RecentDecisionRow = (
     name!(reason_code, &'static str),
 );
 
+type ScopeNameRow = (
+    name!(scope_kind, &'static str),
+    name!(scope_hash, i64),
+    name!(scope_value, String),
+    name!(first_seen_epoch_ms, i64),
+    name!(last_seen_epoch_ms, i64),
+    name!(seen_count, i64),
+);
+
 #[pg_extern(stable)]
 #[allow(clippy::type_complexity)]
 fn pwb_counters() -> TableIterator<
@@ -75,6 +86,7 @@ fn pwb_counters() -> TableIterator<
         name!(missing_actual_wal_count, i64),
         name!(internal_fail_open_count, i64),
         name!(aborted_after_charge_count, i64),
+        name!(scope_name_drop_count, i64),
     ),
 > {
     let counters = shmem::snapshot_counters().unwrap_or_else(errors::raise);
@@ -143,6 +155,23 @@ fn pwb_recent_decisions(
     TableIterator::new(decisions.into_iter().map(recent_decision_row))
 }
 
+#[pg_extern(stable)]
+#[allow(clippy::type_complexity)]
+fn pwb_scope_names() -> TableIterator<
+    'static,
+    (
+        name!(scope_kind, &'static str),
+        name!(scope_hash, i64),
+        name!(scope_value, String),
+        name!(first_seen_epoch_ms, i64),
+        name!(last_seen_epoch_ms, i64),
+        name!(seen_count, i64),
+    ),
+> {
+    let scope_names = shmem::snapshot_scope_names().unwrap_or_else(errors::raise);
+    TableIterator::new(scope_names.into_iter().map(scope_name_row))
+}
+
 #[pg_extern]
 fn pwb_reset_stats() {
     privileges::require(PrivilegeGate::Admin, "reset pg_wal_budget stats")
@@ -189,6 +218,7 @@ const fn counters_row(counters: PwbCounters) -> CountersRow {
         u64_to_i64_saturating(counters.missing_actual_wal_count),
         u64_to_i64_saturating(counters.internal_fail_open_count),
         u64_to_i64_saturating(counters.aborted_after_charge_count),
+        u64_to_i64_saturating(counters.scope_name_drop_count),
     )
 }
 
@@ -230,6 +260,17 @@ fn recent_decision_row(record: RecentDecisionRecord) -> RecentDecisionRow {
         wal_bytes_to_i64_saturating(record.available_before),
         wal_bytes_to_i64_saturating(record.available_after),
         record.reason_code.as_sql_str(),
+    )
+}
+
+fn scope_name_row(snapshot: ScopeNameSnapshot) -> ScopeNameRow {
+    (
+        snapshot.scope_kind.as_sql_str(),
+        u64_to_i64_saturating(snapshot.scope_hash),
+        snapshot.scope_value,
+        u64_to_i64_saturating(snapshot.first_seen_epoch_ms),
+        u64_to_i64_saturating(snapshot.last_seen_epoch_ms),
+        u64_to_i64_saturating(snapshot.seen_count),
     )
 }
 

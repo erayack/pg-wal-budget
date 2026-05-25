@@ -140,7 +140,8 @@ returns table (
   scope_debt_bytes bigint,
   missing_actual_wal_count bigint,
   internal_fail_open_count bigint,
-  aborted_after_charge_count bigint
+  aborted_after_charge_count bigint,
+  scope_name_drop_count bigint
 )
 language c
 stable
@@ -192,6 +193,19 @@ returns table (
 language c
 stable
 as 'MODULE_PATHNAME', 'pwb_recent_decisions_wrapper';
+
+create function pwb.scope_names()
+returns table (
+  scope_kind text,
+  scope_hash bigint,
+  scope_value text,
+  first_seen_epoch_ms bigint,
+  last_seen_epoch_ms bigint,
+  seen_count bigint
+)
+language c
+stable
+as 'MODULE_PATHNAME', 'pwb_scope_names_wrapper';
 
 create function pwb.reset_stats()
 returns void
@@ -275,11 +289,13 @@ revoke all on function pwb.counters() from public;
 revoke all on function pwb.scope_stats() from public;
 revoke all on function pwb.query_profiles() from public;
 revoke all on function pwb.recent_decisions(integer) from public;
+revoke all on function pwb.scope_names() from public;
 grant execute on function pwb.policies() to pwb_admin, pwb_monitor;
 grant execute on function pwb.counters() to pwb_admin, pwb_monitor;
 grant execute on function pwb.scope_stats() to pwb_admin, pwb_monitor;
 grant execute on function pwb.query_profiles() to pwb_admin, pwb_monitor;
 grant execute on function pwb.recent_decisions(integer) to pwb_admin, pwb_monitor;
+grant execute on function pwb.scope_names() to pwb_admin;
 
 revoke all on function pwb.reset_stats() from public;
 revoke all on function pwb.reset_profiles() from public;

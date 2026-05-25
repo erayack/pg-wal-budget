@@ -4,6 +4,8 @@ use crate::types::{
     ScopeKind, StatementClass, WalBytes,
 };
 
+pub(super) const SCOPE_NAME_VALUE_BYTES: usize = 256;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PwbSharedState {
@@ -12,6 +14,7 @@ pub(super) struct PwbSharedState {
     pub(super) recent_decision_capacity: u32,
     pub(super) profile_cache_capacity: u32,
     pub(super) budget_bucket_capacity: u32,
+    pub(super) scope_name_capacity: u32,
     pub(super) recent_decision_head: u64,
     pub(super) recent_decision_count: u32,
     pub(super) profiles_len: u32,
@@ -37,6 +40,7 @@ pub(crate) struct PwbCounters {
     pub(crate) missing_actual_wal_count: u64,
     pub(crate) internal_fail_open_count: u64,
     pub(crate) aborted_after_charge_count: u64,
+    pub(crate) scope_name_drop_count: u64,
 }
 
 impl PwbCounters {
@@ -67,6 +71,9 @@ impl PwbCounters {
         self.aborted_after_charge_count = self
             .aborted_after_charge_count
             .saturating_add(delta.aborted_after_charge_count);
+        self.scope_name_drop_count = self
+            .scope_name_drop_count
+            .saturating_add(delta.scope_name_drop_count);
     }
 }
 
@@ -147,6 +154,36 @@ pub(super) struct PwbBudgetBucket {
     pub(super) debt_bytes: WalBytes,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PwbScopeName {
+    pub(super) occupied: u8,
+    pub(super) scope_kind: u8,
+    pub(super) value_len: u16,
+    pub(super) _padding: [u8; 4],
+    pub(super) scope_hash: ScopeHash,
+    pub(super) first_seen_epoch_ms: EpochMillis,
+    pub(super) last_seen_epoch_ms: EpochMillis,
+    pub(super) seen_count: u64,
+    pub(super) value_bytes: [u8; SCOPE_NAME_VALUE_BYTES],
+}
+
+impl Default for PwbScopeName {
+    fn default() -> Self {
+        Self {
+            occupied: 0,
+            scope_kind: 0,
+            value_len: 0,
+            _padding: [0; 4],
+            scope_hash: 0,
+            first_seen_epoch_ms: 0,
+            last_seen_epoch_ms: 0,
+            seen_count: 0,
+            value_bytes: [0; SCOPE_NAME_VALUE_BYTES],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BudgetBucketState {
     pub(crate) policy_id: PolicyId,
@@ -176,6 +213,16 @@ pub(crate) struct BudgetBucketSnapshot {
     pub(crate) debt_bytes: WalBytes,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopeNameSnapshot {
+    pub(crate) scope_kind: ScopeKind,
+    pub(crate) scope_hash: ScopeHash,
+    pub(crate) scope_value: String,
+    pub(crate) first_seen_epoch_ms: EpochMillis,
+    pub(crate) last_seen_epoch_ms: EpochMillis,
+    pub(crate) seen_count: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CounterDelta {
     pub(crate) accepted_statements: u64,
@@ -188,6 +235,7 @@ pub(crate) struct CounterDelta {
     pub(crate) missing_actual_wal_count: u64,
     pub(crate) internal_fail_open_count: u64,
     pub(crate) aborted_after_charge_count: u64,
+    pub(crate) scope_name_drop_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,6 +374,83 @@ impl PwbBudgetBucket {
     }
 }
 
+impl PwbScopeName {
+    pub(super) fn encode_value(
+        scope_kind: ScopeKind,
+        scope_hash: ScopeHash,
+        scope_value: &str,
+        first_seen_epoch_ms: EpochMillis,
+        last_seen_epoch_ms: EpochMillis,
+        seen_count: u64,
+    ) -> Self {
+        let mut value_bytes = [0; SCOPE_NAME_VALUE_BYTES];
+        let truncated = truncate_utf8(scope_value, SCOPE_NAME_VALUE_BYTES);
+        value_bytes[..truncated.len()].copy_from_slice(truncated.as_bytes());
+
+        Self {
+            occupied: 1,
+            scope_kind: encode_scope_kind(scope_kind),
+            value_len: scope_name_value_len(truncated.len()),
+            _padding: [0; 4],
+            scope_hash,
+            first_seen_epoch_ms,
+            last_seen_epoch_ms,
+            seen_count,
+            value_bytes,
+        }
+    }
+
+    pub(super) fn decode(self) -> PwbResult<ScopeNameSnapshot> {
+        if self.occupied != 1 {
+            return Err(PwbError::Internal {
+                message: format!("invalid scope name occupied flag: {}", self.occupied),
+            });
+        }
+        let value_len = usize::from(self.value_len);
+        if value_len > SCOPE_NAME_VALUE_BYTES {
+            return Err(PwbError::Internal {
+                message: format!("invalid scope name value length: {value_len}"),
+            });
+        }
+        let scope_value = std::str::from_utf8(&self.value_bytes[..value_len]).map_err(|error| {
+            PwbError::Internal {
+                message: format!("invalid scope name UTF-8 in shared memory: {error}"),
+            }
+        })?;
+
+        Ok(ScopeNameSnapshot {
+            scope_kind: decode_scope_kind(self.scope_kind)?,
+            scope_hash: self.scope_hash,
+            scope_value: scope_value.to_string(),
+            first_seen_epoch_ms: self.first_seen_epoch_ms,
+            last_seen_epoch_ms: self.last_seen_epoch_ms,
+            seen_count: self.seen_count,
+        })
+    }
+
+    pub(super) const fn matches_key(self, scope_kind: ScopeKind, scope_hash: ScopeHash) -> bool {
+        self.occupied == 1
+            && self.scope_kind == encode_scope_kind(scope_kind)
+            && self.scope_hash == scope_hash
+    }
+}
+
+fn scope_name_value_len(value_len: usize) -> u16 {
+    u16::try_from(value_len).unwrap_or(u16::MAX)
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 fn decode_optional<T: Copy>(flag: u8, value: T) -> PwbResult<Option<T>> {
     match flag {
         0 => Ok(None),
@@ -390,7 +515,7 @@ fn decode_reason_code(value: u8) -> PwbResult<ReasonCode> {
     }
 }
 
-const fn encode_scope_kind(kind: ScopeKind) -> u8 {
+pub(super) const fn encode_scope_kind(kind: ScopeKind) -> u8 {
     match kind {
         ScopeKind::Database => 1,
         ScopeKind::Role => 2,
@@ -446,6 +571,7 @@ pub(super) fn test_state(shmem_capacity: u32) -> PwbSharedState {
         recent_decision_capacity: shmem_capacity,
         profile_cache_capacity: shmem_capacity,
         budget_bucket_capacity: shmem_capacity,
+        scope_name_capacity: shmem_capacity,
         recent_decision_head: 0,
         recent_decision_count: 0,
         profiles_len: 0,
@@ -521,6 +647,55 @@ mod tests {
         assert_eq!(decoded_global.scope_hash, None);
         assert_eq!(decoded_global.query_id, 42);
         assert_eq!(decoded_global.profile.ewma_wal_bytes, 200);
+    }
+
+    #[test]
+    fn encodes_and_decodes_scope_name() {
+        let snapshot = ScopeNameSnapshot {
+            scope_kind: ScopeKind::Tenant,
+            scope_hash: 99,
+            scope_value: "tenant-a".to_string(),
+            first_seen_epoch_ms: 123,
+            last_seen_epoch_ms: 456,
+            seen_count: 7,
+        };
+
+        let encoded = PwbScopeName::encode_value(
+            snapshot.scope_kind,
+            snapshot.scope_hash,
+            &snapshot.scope_value,
+            snapshot.first_seen_epoch_ms,
+            snapshot.last_seen_epoch_ms,
+            snapshot.seen_count,
+        );
+        let decoded = encoded.decode().unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn scope_name_truncation_keeps_valid_utf8() {
+        let snapshot = ScopeNameSnapshot {
+            scope_kind: ScopeKind::Application,
+            scope_hash: 99,
+            scope_value: format!("{}é", "a".repeat(SCOPE_NAME_VALUE_BYTES - 1)),
+            first_seen_epoch_ms: 123,
+            last_seen_epoch_ms: 456,
+            seen_count: 1,
+        };
+
+        let decoded = PwbScopeName::encode_value(
+            snapshot.scope_kind,
+            snapshot.scope_hash,
+            &snapshot.scope_value,
+            snapshot.first_seen_epoch_ms,
+            snapshot.last_seen_epoch_ms,
+            snapshot.seen_count,
+        )
+        .decode()
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(decoded.scope_value, "a".repeat(SCOPE_NAME_VALUE_BYTES - 1));
     }
 
     #[test]

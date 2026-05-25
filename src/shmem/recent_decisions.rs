@@ -5,26 +5,34 @@ use super::with_locked_state;
 
 pub(crate) fn record_recent_decision(record: RecentDecisionRecord) -> PwbResult<()> {
     with_locked_state(|state, recent_decisions, _profiles| {
-        let capacity = recent_decision_capacity(state);
-        if capacity == 0 {
-            return Ok(());
-        }
-
-        if state.recent_decision_head == u64::MAX {
-            state.recent_decision_head = 0;
-            state.recent_decision_count = 0;
-            recent_decisions.fill(PwbRecentDecision::default());
-        }
-
-        let slot = ring_slot(state.recent_decision_head, capacity);
-        recent_decisions[slot] = PwbRecentDecision::encode(record);
-        state.recent_decision_head = state.recent_decision_head.saturating_add(1);
-        state.recent_decision_count = state
-            .recent_decision_count
-            .saturating_add(1)
-            .min(state.recent_decision_capacity);
+        record_recent_decision_locked(state, recent_decisions, record);
         Ok(())
     })
+}
+
+pub(super) fn record_recent_decision_locked(
+    state: &mut PwbSharedState,
+    recent_decisions: &mut [PwbRecentDecision],
+    record: RecentDecisionRecord,
+) {
+    let capacity = recent_decision_capacity(state);
+    if capacity == 0 {
+        return;
+    }
+
+    if state.recent_decision_head == u64::MAX {
+        state.recent_decision_head = 0;
+        state.recent_decision_count = 0;
+        recent_decisions.fill(PwbRecentDecision::default());
+    }
+
+    let slot = ring_slot(state.recent_decision_head, capacity);
+    recent_decisions[slot] = PwbRecentDecision::encode(record);
+    state.recent_decision_head = state.recent_decision_head.saturating_add(1);
+    state.recent_decision_count = state
+        .recent_decision_count
+        .saturating_add(1)
+        .min(state.recent_decision_capacity);
 }
 
 pub(crate) fn snapshot_recent_decisions(limit: usize) -> PwbResult<Vec<RecentDecisionRecord>> {

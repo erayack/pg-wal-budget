@@ -134,8 +134,7 @@ fn record_admission_decision(
     now_epoch_ms: EpochMillis,
 ) {
     let delta = counter_delta_for_decision(decision, context.predicted_wal_bytes);
-    let _ = shmem::add_counters(delta);
-    let _ = shmem::record_recent_decision(RecentDecisionRecord {
+    let recent_decision = RecentDecisionRecord {
         timestamp_epoch_ms: now_epoch_ms,
         decision_kind: decision.kind,
         policy_id: decision.policy_id,
@@ -148,5 +147,6 @@ fn record_admission_decision(
         available_before: decision.available_before,
         available_after: decision.available_after,
         reason_code: decision.reason_code,
-    });
+    };
+    let _ = shmem::record_admission_telemetry(delta, recent_decision, &context.scope, now_epoch_ms);
 }

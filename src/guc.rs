@@ -25,6 +25,7 @@ static SHMEM_CAPACITY: GucSetting<i32> = GucSetting::<i32>::new(SHMEM_CAPACITY_V
 static RECENT_DECISION_CAPACITY: GucSetting<i32> = GucSetting::<i32>::new(INHERIT_CAPACITY_VALUE);
 static PROFILE_CACHE_CAPACITY: GucSetting<i32> = GucSetting::<i32>::new(INHERIT_CAPACITY_VALUE);
 static BUDGET_BUCKET_CAPACITY: GucSetting<i32> = GucSetting::<i32>::new(INHERIT_CAPACITY_VALUE);
+static SCOPE_NAME_CAPACITY: GucSetting<i32> = GucSetting::<i32>::new(INHERIT_CAPACITY_VALUE);
 static COMPOSITE_SCOPE_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(false);
 static PREDICTOR: GucSetting<PredictorKind> =
     GucSetting::<PredictorKind>::new(PredictorKind::ProfileEwma);
@@ -173,6 +174,17 @@ fn register_capacity_gucs() {
         GucContext::Postmaster,
         GucFlags::default(),
     );
+
+    GucRegistry::define_int_guc(
+        c"pwb.scope_name_capacity",
+        c"Scope name reverse-lookup capacity.",
+        c"Capacity of the pg_wal_budget shared-memory scope name reverse-lookup array. -1 inherits pwb.shmem_capacity. Changes require restart.",
+        &SCOPE_NAME_CAPACITY,
+        INHERIT_CAPACITY_VALUE,
+        MAX_CAPACITY_VALUE,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
 }
 
 pub(crate) fn enabled() -> bool {
@@ -209,6 +221,10 @@ pub(crate) fn profile_cache_capacity() -> usize {
 
 pub(crate) fn budget_bucket_capacity() -> usize {
     specific_or_legacy_capacity(BUDGET_BUCKET_CAPACITY.get())
+}
+
+pub(crate) fn scope_name_capacity() -> usize {
+    specific_or_legacy_capacity(SCOPE_NAME_CAPACITY.get())
 }
 
 pub(crate) fn composite_scope_enabled() -> bool {

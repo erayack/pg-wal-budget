@@ -2,7 +2,9 @@ use core::mem::{align_of, size_of};
 
 use crate::errors::{PwbError, PwbResult};
 
-use super::records::{PwbBudgetBucket, PwbProfileEntry, PwbRecentDecision, PwbSharedState};
+use super::records::{
+    PwbBudgetBucket, PwbProfileEntry, PwbRecentDecision, PwbScopeName, PwbSharedState,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SharedLayout {
@@ -10,9 +12,11 @@ pub(super) struct SharedLayout {
     pub(super) recent_decisions_offset: usize,
     pub(super) profiles_offset: usize,
     pub(super) budget_buckets_offset: usize,
+    pub(super) scope_names_offset: usize,
     pub(super) recent_decision_capacity: usize,
     pub(super) profile_cache_capacity: usize,
     pub(super) budget_bucket_capacity: usize,
+    pub(super) scope_name_capacity: usize,
 }
 
 impl SharedLayout {
@@ -22,9 +26,11 @@ impl SharedLayout {
             recent_decisions_offset: 0,
             profiles_offset: 0,
             budget_buckets_offset: 0,
+            scope_names_offset: 0,
             recent_decision_capacity: 0,
             profile_cache_capacity: 0,
             budget_bucket_capacity: 0,
+            scope_name_capacity: 0,
         }
     }
 }
@@ -34,6 +40,7 @@ pub(super) struct SharedCapacities {
     pub(super) recent_decisions: usize,
     pub(super) profiles: usize,
     pub(super) budget_buckets: usize,
+    pub(super) scope_names: usize,
 }
 
 pub(super) fn compute_layout(capacities: SharedCapacities) -> PwbResult<SharedLayout> {
@@ -60,14 +67,23 @@ pub(super) fn compute_layout(capacities: SharedCapacities) -> PwbResult<SharedLa
         checked_mul(capacities.budget_buckets, size_of::<PwbBudgetBucket>())?,
     )?;
 
+    offset = align_up(offset, align_of::<PwbScopeName>())?;
+    let scope_names_offset = offset;
+    offset = checked_add(
+        offset,
+        checked_mul(capacities.scope_names, size_of::<PwbScopeName>())?,
+    )?;
+
     Ok(SharedLayout {
         total_bytes: offset,
         recent_decisions_offset,
         profiles_offset,
         budget_buckets_offset,
+        scope_names_offset,
         recent_decision_capacity: capacities.recent_decisions,
         profile_cache_capacity: capacities.profiles,
         budget_bucket_capacity: capacities.budget_buckets,
+        scope_name_capacity: capacities.scope_names,
     })
 }
 
@@ -108,6 +124,7 @@ mod tests {
             recent_decisions: 3,
             profiles: 5,
             budget_buckets: 7,
+            scope_names: 11,
         })
         .unwrap_or_else(|error| panic!("{error}"));
 
@@ -121,9 +138,11 @@ mod tests {
             layout.budget_buckets_offset % align_of::<PwbBudgetBucket>(),
             0
         );
+        assert_eq!(layout.scope_names_offset % align_of::<PwbScopeName>(), 0);
         assert_eq!(layout.recent_decision_capacity, 3);
         assert_eq!(layout.profile_cache_capacity, 5);
         assert_eq!(layout.budget_bucket_capacity, 7);
+        assert_eq!(layout.scope_name_capacity, 11);
     }
 
     #[test]
@@ -132,12 +151,14 @@ mod tests {
             recent_decisions: 0,
             profiles: 0,
             budget_buckets: 0,
+            scope_names: 0,
         })
         .unwrap_or_else(|error| panic!("{error}"));
 
         assert_eq!(layout.recent_decision_capacity, 0);
         assert_eq!(layout.profile_cache_capacity, 0);
         assert_eq!(layout.budget_bucket_capacity, 0);
+        assert_eq!(layout.scope_name_capacity, 0);
     }
 
     #[test]
@@ -147,6 +168,7 @@ mod tests {
                 recent_decisions: usize::MAX,
                 profiles: 0,
                 budget_buckets: 0,
+                scope_names: 0,
             })
             .is_err()
         );

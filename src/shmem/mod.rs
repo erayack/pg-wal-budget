@@ -5,6 +5,7 @@ use pgrx::pg_sys;
 
 use crate::errors::{PwbError, PwbResult};
 use crate::guc;
+use crate::types::ScopeKey;
 
 mod budget_buckets;
 mod counters;
@@ -12,6 +13,7 @@ mod layout;
 mod profiles;
 mod recent_decisions;
 mod records;
+mod scope_names;
 
 pub(crate) use budget_buckets::{
     snapshot_budget_buckets, with_budget_bucket, with_existing_budget_bucket,
@@ -26,14 +28,15 @@ pub(crate) use profiles::{
 pub(crate) use recent_decisions::{record_recent_decision, snapshot_recent_decisions};
 pub(crate) use records::{
     BudgetBucketSnapshot, BudgetBucketState, CounterDelta, PwbCounters, QueryProfileSnapshot,
-    RecentDecisionRecord,
+    RecentDecisionRecord, ScopeNameSnapshot,
 };
-use records::{PwbBudgetBucket, PwbProfileEntry, PwbRecentDecision, PwbSharedState};
+use records::{PwbBudgetBucket, PwbProfileEntry, PwbRecentDecision, PwbScopeName, PwbSharedState};
+pub(crate) use scope_names::snapshot_scope_names;
 
 const SHMEM_NAME: &[u8] = b"pg_wal_budget shared state\0";
 const LWLOCK_TRANCHE_NAME: &[u8] = b"pg_wal_budget\0";
 const MAGIC: u32 = 0x5057_4201;
-const LAYOUT_VERSION: u32 = 5;
+const LAYOUT_VERSION: u32 = 6;
 static mut SHARED_STATE: *mut PwbSharedState = ptr::null_mut();
 static mut SHARED_LOCK: *mut pg_sys::LWLock = ptr::null_mut();
 static mut PREV_SHMEM_REQUEST_HOOK: pg_sys::shmem_request_hook_type = None;
@@ -64,6 +67,7 @@ unsafe extern "C-unwind" fn shmem_request() {
         recent_decisions: guc::recent_decision_capacity(),
         profiles: guc::profile_cache_capacity(),
         budget_buckets: guc::budget_bucket_capacity(),
+        scope_names: guc::scope_name_capacity(),
     }) {
         Ok(layout) => layout,
         Err(error) => raise_startup_error(&error),
@@ -92,11 +96,41 @@ pub(crate) fn is_available() -> bool {
 }
 
 pub(crate) fn reset_stats() -> PwbResult<()> {
-    with_locked_state(|state, recent_decisions, _profiles| {
+    with_locked_stats_state(|state, recent_decisions, scope_names| {
         state.counters = PwbCounters::default();
         state.recent_decision_head = 0;
         state.recent_decision_count = 0;
         recent_decisions.fill(PwbRecentDecision::default());
+        scope_names.fill(PwbScopeName::default());
+        Ok(())
+    })
+}
+
+pub(crate) fn record_admission_telemetry(
+    delta: CounterDelta,
+    recent_decision: RecentDecisionRecord,
+    scope: &ScopeKey,
+    now_epoch_ms: u64,
+) -> PwbResult<()> {
+    with_locked_stats_state(|state, recent_decisions, scope_names| {
+        state.counters.saturating_add_delta(delta);
+        recent_decisions::record_recent_decision_locked(state, recent_decisions, recent_decision);
+
+        let Some(scope_value) = scope.debug_value.as_deref() else {
+            return Ok(());
+        };
+        if scope_names::record_scope_name_in_slice(
+            scope_names,
+            scope.kind,
+            scope.value_hash,
+            scope_value,
+            now_epoch_ms,
+        ) == scope_names::ScopeNameRecordResult::Dropped
+        {
+            state.counters.scope_name_drop_count =
+                state.counters.scope_name_drop_count.saturating_add(1);
+        }
+
         Ok(())
     })
 }
@@ -159,6 +193,7 @@ unsafe fn initialize_state(state: *mut PwbSharedState, layout: SharedLayout) {
                 recent_decision_capacity: capacity_to_u32(layout.recent_decision_capacity),
                 profile_cache_capacity: capacity_to_u32(layout.profile_cache_capacity),
                 budget_bucket_capacity: capacity_to_u32(layout.budget_bucket_capacity),
+                scope_name_capacity: capacity_to_u32(layout.scope_name_capacity),
                 recent_decision_head: 0,
                 recent_decision_count: 0,
                 profiles_len: 0,
@@ -172,6 +207,58 @@ unsafe fn initialize_state(state: *mut PwbSharedState, layout: SharedLayout) {
             },
         );
     }
+}
+
+fn with_locked_scope_name_state<R>(
+    callback: impl FnOnce(&mut PwbSharedState, &mut [PwbScopeName]) -> PwbResult<R>,
+) -> PwbResult<R> {
+    let _guard = SharedLockGuard::acquire()?;
+    let state = shared_state_mut()?;
+    let layout = current_layout()?;
+
+    // SAFETY: The startup hook stores a pointer returned by ShmemInitStruct for this exact layout.
+    // The extension LWLock is held for the duration of the returned mutable slice.
+    let scope_names = unsafe {
+        slice_from_region_mut::<PwbScopeName>(
+            ptr::from_mut(state).cast::<u8>(),
+            layout.scope_names_offset,
+            layout.scope_name_capacity,
+        )
+    };
+
+    callback(state, scope_names)
+}
+
+fn with_locked_stats_state<R>(
+    callback: impl FnOnce(
+        &mut PwbSharedState,
+        &mut [PwbRecentDecision],
+        &mut [PwbScopeName],
+    ) -> PwbResult<R>,
+) -> PwbResult<R> {
+    let _guard = SharedLockGuard::acquire()?;
+    let state = shared_state_mut()?;
+    let layout = current_layout()?;
+
+    // SAFETY: The startup hook stores a pointer returned by ShmemInitStruct for this exact layout.
+    // The extension LWLock is held for the duration of the returned mutable slices.
+    let recent_decisions = unsafe {
+        slice_from_region_mut::<PwbRecentDecision>(
+            ptr::from_mut(state).cast::<u8>(),
+            layout.recent_decisions_offset,
+            layout.recent_decision_capacity,
+        )
+    };
+    // SAFETY: Same as above; this region begins at the precomputed scope-name offset.
+    let scope_names = unsafe {
+        slice_from_region_mut::<PwbScopeName>(
+            ptr::from_mut(state).cast::<u8>(),
+            layout.scope_names_offset,
+            layout.scope_name_capacity,
+        )
+    };
+
+    callback(state, recent_decisions, scope_names)
 }
 
 fn with_locked_state<R>(

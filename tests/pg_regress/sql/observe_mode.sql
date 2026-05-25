@@ -29,3 +29,23 @@ select
       and available_before = 0
       and available_after = 0
   ) as observe_decision_recorded;
+
+select
+  exists (
+    select 1
+    from pwb.scope_names()
+    where scope_kind = 'role'
+      and scope_value = current_user
+      and seen_count > 0
+  ) as role_scope_name_recorded;
+
+select
+  exists (
+    select 1
+    from pwb.recent_decisions(20) d
+    join pwb.scope_names() n
+      on n.scope_kind = d.scope_kind
+     and n.scope_hash = d.scope_hash
+    where d.policy_id = 1
+      and n.scope_value = current_user
+  ) as recent_decision_scope_name_joined;
