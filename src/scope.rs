@@ -5,6 +5,7 @@ use pgrx::pg_sys;
 use pgrx::prelude::*;
 
 use crate::errors::{self, PwbError, PwbResult};
+use crate::guc;
 use crate::privileges::{self, PrivilegeGate};
 use crate::types::{ScopeHash, ScopeKey, ScopeKind};
 
@@ -19,6 +20,12 @@ thread_local! {
 pub(crate) struct BackendScopeState {
     pub(crate) tenant: Option<String>,
     pub(crate) last_scope_hash: Option<ScopeHash>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScopeComponent {
+    kind: ScopeKind,
+    value: String,
 }
 
 #[pg_extern]
@@ -36,20 +43,18 @@ fn pwb_clear_tenant() {
 }
 
 pub(crate) fn classify_current_scope() -> PwbResult<ScopeKey> {
-    if let Some(tenant) = current_tenant() {
-        return Ok(scope_key_with_debug(ScopeKind::Tenant, tenant));
+    if !guc::composite_scope_enabled() {
+        return classify_current_scope_by_precedence();
     }
 
-    if let Some(role) = current_role_name() {
-        return Ok(scope_key_with_debug(ScopeKind::Role, role));
+    let components = current_scope_components();
+
+    if let Some(composite) = composite_scope_value(&components) {
+        return Ok(scope_key_with_debug(ScopeKind::Composite, composite));
     }
 
-    if let Some(database) = current_database_name() {
-        return Ok(scope_key_with_debug(ScopeKind::Database, database));
-    }
-
-    if let Some(application) = current_application_name() {
-        return Ok(scope_key_with_debug(ScopeKind::Application, application));
+    if let Some(component) = components.into_iter().next() {
+        return Ok(scope_key_with_debug(component.kind, component.value));
     }
 
     Err(PwbError::MissingScope)
@@ -80,6 +85,74 @@ fn clear_tenant_impl() {
     });
 }
 
+fn classify_current_scope_by_precedence() -> PwbResult<ScopeKey> {
+    if let Some(tenant) = current_tenant() {
+        return Ok(scope_key_with_debug(ScopeKind::Tenant, tenant));
+    }
+
+    if let Some(role) = current_role_name() {
+        return Ok(scope_key_with_debug(ScopeKind::Role, role));
+    }
+
+    if let Some(database) = current_database_name() {
+        return Ok(scope_key_with_debug(ScopeKind::Database, database));
+    }
+
+    if let Some(application) = current_application_name() {
+        return Ok(scope_key_with_debug(ScopeKind::Application, application));
+    }
+
+    Err(PwbError::MissingScope)
+}
+
+fn current_scope_components() -> Vec<ScopeComponent> {
+    let mut components = Vec::with_capacity(4);
+
+    if let Some(tenant) = current_tenant() {
+        components.push(ScopeComponent {
+            kind: ScopeKind::Tenant,
+            value: tenant,
+        });
+    }
+    if let Some(role) = current_role_name() {
+        components.push(ScopeComponent {
+            kind: ScopeKind::Role,
+            value: role,
+        });
+    }
+    if let Some(database) = current_database_name() {
+        components.push(ScopeComponent {
+            kind: ScopeKind::Database,
+            value: database,
+        });
+    }
+    if let Some(application) = current_application_name() {
+        components.push(ScopeComponent {
+            kind: ScopeKind::Application,
+            value: application,
+        });
+    }
+
+    components
+}
+
+fn composite_scope_value(components: &[ScopeComponent]) -> Option<String> {
+    if components.len() < 2 {
+        return None;
+    }
+
+    let mut value = String::new();
+    for component in components {
+        if !value.is_empty() {
+            value.push('|');
+        }
+        value.push_str(component.kind.as_sql_str());
+        value.push('=');
+        value.push_str(&component.value);
+    }
+    Some(value)
+}
+
 fn normalize_tenant_value(tenant: &str) -> PwbResult<String> {
     let normalized = tenant.trim();
     if normalized.is_empty() {
@@ -87,6 +160,13 @@ fn normalize_tenant_value(tenant: &str) -> PwbResult<String> {
             field: "tenant",
             value: "<empty>".to_string(),
             reason: "must not be empty",
+        });
+    }
+    if normalized.contains(['|', '=']) {
+        return Err(PwbError::InvalidPolicyValue {
+            field: "tenant",
+            value: normalized.to_string(),
+            reason: "must not contain composite scope delimiters '|' or '='",
         });
     }
 
@@ -158,7 +238,7 @@ unsafe fn borrowed_cstring_to_nonempty_string(ptr: *const core::ffi::c_char) -> 
     if value.is_empty() { None } else { Some(value) }
 }
 
-fn hash_scope_value(kind: ScopeKind, value: &str) -> ScopeHash {
+pub(crate) fn hash_scope_value(kind: ScopeKind, value: &str) -> ScopeHash {
     let mut hash = FNV_OFFSET_BASIS;
     hash = fnv1a_update(hash, &[scope_kind_hash_tag(kind)]);
     hash = fnv1a_update(hash, b":");
@@ -201,6 +281,12 @@ mod tests {
     }
 
     #[test]
+    fn rejects_tenant_values_with_composite_delimiters() {
+        assert!(normalize_tenant_value("tenant|a").is_err());
+        assert!(normalize_tenant_value("tenant=a").is_err());
+    }
+
+    #[test]
     fn scope_hash_includes_kind() {
         assert_ne!(
             hash_scope_value(ScopeKind::Tenant, "same-value"),
@@ -213,6 +299,43 @@ mod tests {
         assert_eq!(
             hash_scope_value(ScopeKind::Tenant, "tenant-a"),
             hash_scope_value(ScopeKind::Tenant, "tenant-a")
+        );
+    }
+
+    #[test]
+    fn composite_scope_requires_at_least_two_components() {
+        let components = [ScopeComponent {
+            kind: ScopeKind::Tenant,
+            value: "tenant-a".to_string(),
+        }];
+
+        assert_eq!(composite_scope_value(&components), None);
+    }
+
+    #[test]
+    fn composite_scope_value_uses_stable_component_order() {
+        let components = [
+            ScopeComponent {
+                kind: ScopeKind::Tenant,
+                value: "tenant-a".to_string(),
+            },
+            ScopeComponent {
+                kind: ScopeKind::Role,
+                value: "app_user".to_string(),
+            },
+            ScopeComponent {
+                kind: ScopeKind::Database,
+                value: "postgres".to_string(),
+            },
+            ScopeComponent {
+                kind: ScopeKind::Application,
+                value: "worker".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            composite_scope_value(&components).as_deref(),
+            Some("tenant=tenant-a|role=app_user|database=postgres|application=worker")
         );
     }
 

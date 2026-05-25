@@ -2,7 +2,7 @@
 
 A Rust/pgrx PostgreSQL 17 extension that observes, predicts, and optionally enforces WAL-generation budgets by policy scope.
 
-Hooks (executor + utility) and shared-memory state are installed from `_PG_init`. SQL functions live in the `pwb` schema. MVP status: observe / shadow / reject modes, durable policies, scope classification by tenant → role → database → `application_name`, and exact backend-local WAL telemetry where PostgreSQL exposes `pgWalUsage`. Unsupported targets fall back to approximate insert-LSN telemetry. No queue/wait mode, no cross-node coordination, no replica-lag throttling yet.
+Hooks (executor + utility) and shared-memory state are installed from `_PG_init`. SQL functions live in the `pwb` schema. MVP status: observe / shadow / reject modes, durable policies, scope classification by tenant → role → database → `application_name`, optional composite scopes, and exact backend-local WAL telemetry where PostgreSQL exposes `pgWalUsage`. Unsupported targets mark actual WAL telemetry unavailable. No queue/wait mode, no cross-node coordination, no replica-lag throttling yet.
 
 ## Install
 
@@ -59,6 +59,7 @@ select pwb.disable_policy(1);
 - Scope kinds: `tenant`, `role`, `database`, `application`, `composite`.
 - Matching: highest `priority` wins; ties resolved by lowest `policy_id`.
 - Tenant scope is trusted backend-local state; set via `pwb.set_tenant(...)` / `pwb.clear_tenant()`. Restricted to superusers and members of `pwb_tenant_setter`.
+- Composite scopes are opt-in with `pwb.composite_scope_enabled`. Their canonical value is ordered as `tenant=...|role=...|database=...|application=...` with unavailable components omitted.
 
 ## Privileges
 
@@ -84,6 +85,8 @@ Runtime GUCs (SIGHUP):
 | `pwb.default_utility_wal_bytes` | `1MB` | Fallback prediction for utility / `COPY`. |
 | `pwb.max_prediction_bytes` | `1GB` | Upper bound on predictions. |
 | `pwb.profile_ewma_alpha` | `0.5` | EWMA smoothing factor for learned query WAL profiles. |
+| `pwb.composite_scope_enabled` | `off` | Classify statements by canonical composite scope when at least two scope components are available. |
+| `pwb.predictor` | `profile_ewma` | Predictor strategy: `profile_ewma` or `statement_class_fallback`. |
 
 Lower `pwb.profile_ewma_alpha` values smooth predictions over more history; higher values react faster to recent WAL observations.
 
@@ -91,7 +94,10 @@ Postmaster GUCs (restart required, sized into shared memory):
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
-| `pwb.shmem_capacity` | `4096` | Capacity for each shared-memory array: recent decisions, query WAL profiles, and budget buckets. Changes require restart. |
+| `pwb.shmem_capacity` | `4096` | Legacy default capacity for shared-memory arrays. Changes require restart. |
+| `pwb.recent_decision_capacity` | `-1` | Capacity for the recent-decision ring; `-1` inherits `pwb.shmem_capacity`. Changes require restart. |
+| `pwb.profile_cache_capacity` | `-1` | Capacity for the shared-memory query profile cache; `-1` inherits `pwb.shmem_capacity`. Changes require restart. |
+| `pwb.budget_bucket_capacity` | `-1` | Capacity for enforcement budget buckets; `-1` inherits `pwb.shmem_capacity`. Changes require restart. |
 
 Emergency disable:
 
@@ -119,7 +125,7 @@ Recent decisions expose query hashes, query IDs, and workload classifications; t
 ## Caveats
 
 - Exact per-backend WAL measurements are used for query profile updates and budget refund/debt reconciliation.
-- If the target PostgreSQL/pgrx binding does not expose backend-local WAL usage, the extension falls back to insert-LSN deltas. That fallback is approximate, can include WAL from other backend activity, and is not used to refund or charge enforcement buckets.
+- If the target PostgreSQL/pgrx binding does not expose backend-local WAL usage, actual WAL measurement is unavailable and is not used to update profiles, refund, or charge enforcement buckets.
 - Query profiles only update when an exact backend WAL measurement is available; fallback predictions stay important on unsupported targets.
 - Shared-memory state is disposable and resets on PostgreSQL restart.
 - Reject mode can produce false positives until predictions and fallback GUCs are tuned.

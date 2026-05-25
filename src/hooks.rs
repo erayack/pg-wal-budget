@@ -187,7 +187,11 @@ fn admit_normal_statement(
     let statement_class = classify_planned_statement(planned_statement);
     let query_id = extract_query_id(planned_statement);
     let scope = scope::classify_current_scope().map_err(AdmissionError::Internal)?;
-    let predicted_wal_bytes = profile::predict(statement_class, query_id, scope.value_hash);
+    let predicted_wal_bytes = profile::predict_context(&profile::PredictionContext {
+        statement_class,
+        query_id,
+        scope_hash: scope.value_hash,
+    });
     let context = AdmissionContext {
         query_id,
         scope,

@@ -80,3 +80,43 @@ exception
     raise notice 'missing policy rejected';
 end;
 $$;
+
+alter system set pwb.composite_scope_enabled = on;
+select pg_reload_conf();
+select set_config('application_name', 'pwb_policy_test', false);
+select pwb.reset_stats();
+select pwb.create_policy(
+  'composite',
+  'role=' || current_user || '|database=' || current_database() || '|application=pwb_policy_test',
+  1000,
+  2000,
+  'observe',
+  500
+) as composite_policy_id;
+
+create temp table pwb_composite_policy_test (id integer);
+insert into pwb_composite_policy_test values (1);
+
+select
+  exists (
+    select 1
+    from pwb.recent_decisions(20)
+    where policy_id = 3
+      and scope_kind = 'composite'
+      and decision_kind = 'allowed'
+      and reason_code = 'observe_mode'
+  ) as composite_policy_matched;
+
+alter system reset pwb.composite_scope_enabled;
+select pg_reload_conf();
+select set_config('application_name', '', false);
+
+alter system set pwb.predictor = 'statement_class_fallback';
+select pg_reload_conf();
+show pwb.predictor;
+
+\set VERBOSITY sqlstate
+alter system set pwb.predictor = 'invalid_predictor';
+\set VERBOSITY default
+alter system reset pwb.predictor;
+select pg_reload_conf();

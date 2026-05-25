@@ -530,6 +530,24 @@ mod tests {
     }
 
     #[test]
+    fn policy_cache_matches_composite_scope() {
+        let composite = "tenant=tenant-a|role=app_user|database=postgres";
+        let cache = PolicyCache {
+            refreshed_epoch_ms: 1000,
+            policies: vec![
+                cached_policy(POLICY_ID, ScopeKind::Composite, Some(composite)),
+                cached_policy(POLICY_ID + 1, ScopeKind::Composite, None),
+            ],
+        };
+        let scope = ScopeKey::with_debug_value(ScopeKind::Composite, SCOPE_HASH, composite);
+
+        assert_eq!(
+            find_effective_policy(&cache, &scope).map(|policy| policy.policy_id),
+            Some(POLICY_ID)
+        );
+    }
+
+    #[test]
     fn policy_cache_does_not_match_missing_debug_value_to_exact_policy() {
         let cache = PolicyCache {
             refreshed_epoch_ms: 1000,

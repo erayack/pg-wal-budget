@@ -9,7 +9,9 @@ use crate::types::{
 pub(super) struct PwbSharedState {
     pub(super) magic: u32,
     pub(super) layout_version: u32,
-    pub(super) shmem_capacity: u32,
+    pub(super) recent_decision_capacity: u32,
+    pub(super) profile_cache_capacity: u32,
+    pub(super) budget_bucket_capacity: u32,
     pub(super) recent_decision_head: u64,
     pub(super) recent_decision_count: u32,
     pub(super) profiles_len: u32,
@@ -441,7 +443,9 @@ pub(super) fn test_state(shmem_capacity: u32) -> PwbSharedState {
     PwbSharedState {
         magic: super::MAGIC,
         layout_version: super::LAYOUT_VERSION,
-        shmem_capacity,
+        recent_decision_capacity: shmem_capacity,
+        profile_cache_capacity: shmem_capacity,
+        budget_bucket_capacity: shmem_capacity,
         recent_decision_head: 0,
         recent_decision_count: 0,
         profiles_len: 0,

@@ -114,3 +114,88 @@ exception
     raise notice 'missing policy rejected';
 end;
 $$;
+alter system set pwb.composite_scope_enabled = on;
+select pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
+select set_config('application_name', 'pwb_policy_test', false);
+   set_config    
+-----------------
+ pwb_policy_test
+(1 row)
+
+select pwb.reset_stats();
+ reset_stats 
+-------------
+ 
+(1 row)
+
+select pwb.create_policy(
+  'composite',
+  'role=' || current_user || '|database=' || current_database() || '|application=pwb_policy_test',
+  1000,
+  2000,
+  'observe',
+  500
+) as composite_policy_id;
+ composite_policy_id 
+---------------------
+                   3
+(1 row)
+
+create temp table pwb_composite_policy_test (id integer);
+insert into pwb_composite_policy_test values (1);
+select
+  exists (
+    select 1
+    from pwb.recent_decisions(20)
+    where policy_id = 3
+      and scope_kind = 'composite'
+      and decision_kind = 'allowed'
+      and reason_code = 'observe_mode'
+  ) as composite_policy_matched;
+ composite_policy_matched 
+--------------------------
+ t
+(1 row)
+
+alter system reset pwb.composite_scope_enabled;
+select pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
+select set_config('application_name', '', false);
+ set_config 
+------------
+ 
+(1 row)
+
+alter system set pwb.predictor = 'statement_class_fallback';
+select pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
+show pwb.predictor;
+      pwb.predictor       
+--------------------------
+ statement_class_fallback
+(1 row)
+
+\set VERBOSITY sqlstate
+alter system set pwb.predictor = 'invalid_predictor';
+ERROR:  22023
+\set VERBOSITY default
+alter system reset pwb.predictor;
+select pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+

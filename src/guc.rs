@@ -1,4 +1,4 @@
-use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
+use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting, PostgresGucEnum};
 
 use crate::errors::{PwbError, PwbResult};
 use crate::types::{ProfileEwmaWeights, WalBytes};
@@ -7,6 +7,7 @@ const DEFAULT_WRITE_WAL_BYTES_VALUE: i32 = 16 * 1024;
 const DEFAULT_UTILITY_WAL_BYTES_VALUE: i32 = 1024 * 1024;
 const MAX_PREDICTION_BYTES_VALUE: i32 = 1024 * 1024 * 1024;
 const SHMEM_CAPACITY_VALUE: i32 = 4096;
+const INHERIT_CAPACITY_VALUE: i32 = -1;
 const MAX_CAPACITY_VALUE: i32 = 1_000_000;
 const DEFAULT_PROFILE_EWMA_ALPHA_VALUE: f64 = 0.5;
 const MIN_PROFILE_EWMA_ALPHA_VALUE: f64 = 0.000_001;
@@ -21,10 +22,30 @@ static DEFAULT_UTILITY_WAL_BYTES: GucSetting<i32> =
     GucSetting::<i32>::new(DEFAULT_UTILITY_WAL_BYTES_VALUE);
 static MAX_PREDICTION_BYTES: GucSetting<i32> = GucSetting::<i32>::new(MAX_PREDICTION_BYTES_VALUE);
 static SHMEM_CAPACITY: GucSetting<i32> = GucSetting::<i32>::new(SHMEM_CAPACITY_VALUE);
+static RECENT_DECISION_CAPACITY: GucSetting<i32> = GucSetting::<i32>::new(INHERIT_CAPACITY_VALUE);
+static PROFILE_CACHE_CAPACITY: GucSetting<i32> = GucSetting::<i32>::new(INHERIT_CAPACITY_VALUE);
+static BUDGET_BUCKET_CAPACITY: GucSetting<i32> = GucSetting::<i32>::new(INHERIT_CAPACITY_VALUE);
+static COMPOSITE_SCOPE_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(false);
+static PREDICTOR: GucSetting<PredictorKind> =
+    GucSetting::<PredictorKind>::new(PredictorKind::ProfileEwma);
 static PROFILE_EWMA_ALPHA: GucSetting<f64> =
     GucSetting::<f64>::new(DEFAULT_PROFILE_EWMA_ALPHA_VALUE);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PostgresGucEnum)]
+pub(crate) enum PredictorKind {
+    #[name = c"profile_ewma"]
+    ProfileEwma,
+    #[name = c"statement_class_fallback"]
+    StatementClassFallback,
+}
+
 pub(crate) fn register_gucs() {
+    register_runtime_gucs();
+    register_prediction_gucs();
+    register_capacity_gucs();
+}
+
+fn register_runtime_gucs() {
     GucRegistry::define_bool_guc(
         c"pwb.enabled",
         c"Enables pg_wal_budget admission checks.",
@@ -42,7 +63,9 @@ pub(crate) fn register_gucs() {
         GucContext::Sighup,
         GucFlags::default(),
     );
+}
 
+fn register_prediction_gucs() {
     GucRegistry::define_int_guc(
         c"pwb.default_write_wal_bytes",
         c"Fallback WAL prediction for write statements.",
@@ -87,12 +110,65 @@ pub(crate) fn register_gucs() {
         GucFlags::default(),
     );
 
+    GucRegistry::define_bool_guc(
+        c"pwb.composite_scope_enabled",
+        c"Enables composite pg_wal_budget scope classification.",
+        c"Classifies statements by a canonical composite scope when at least two scope components are available. When disabled, pg_wal_budget uses tenant, role, database, then application precedence.",
+        &COMPOSITE_SCOPE_ENABLED,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_enum_guc(
+        c"pwb.predictor",
+        c"Selects the pg_wal_budget WAL predictor.",
+        c"Supported values are profile_ewma and statement_class_fallback.",
+        &PREDICTOR,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+}
+
+fn register_capacity_gucs() {
     GucRegistry::define_int_guc(
         c"pwb.shmem_capacity",
-        c"Shared memory array capacity.",
-        c"Capacity of each pg_wal_budget shared-memory array: recent decisions, query WAL profiles, and budget buckets. Changes require restart.",
+        c"Default shared memory array capacity.",
+        c"Legacy default capacity for pg_wal_budget shared-memory arrays. Specific capacity GUCs override it for recent decisions, query WAL profiles, and budget buckets. Changes require restart.",
         &SHMEM_CAPACITY,
         0,
+        MAX_CAPACITY_VALUE,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pwb.recent_decision_capacity",
+        c"Recent decision ring capacity.",
+        c"Capacity of the pg_wal_budget recent-decision shared-memory ring. -1 inherits pwb.shmem_capacity. Changes require restart.",
+        &RECENT_DECISION_CAPACITY,
+        INHERIT_CAPACITY_VALUE,
+        MAX_CAPACITY_VALUE,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pwb.profile_cache_capacity",
+        c"Query WAL profile cache capacity.",
+        c"Capacity of the pg_wal_budget shared-memory query profile cache. -1 inherits pwb.shmem_capacity. Changes require restart.",
+        &PROFILE_CACHE_CAPACITY,
+        INHERIT_CAPACITY_VALUE,
+        MAX_CAPACITY_VALUE,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pwb.budget_bucket_capacity",
+        c"Budget bucket capacity.",
+        c"Capacity of the pg_wal_budget shared-memory budget bucket array. -1 inherits pwb.shmem_capacity. Changes require restart.",
+        &BUDGET_BUCKET_CAPACITY,
+        INHERIT_CAPACITY_VALUE,
         MAX_CAPACITY_VALUE,
         GucContext::Postmaster,
         GucFlags::default(),
@@ -123,6 +199,26 @@ pub(crate) fn shmem_capacity() -> usize {
     nonnegative_i32_to_usize(SHMEM_CAPACITY.get())
 }
 
+pub(crate) fn recent_decision_capacity() -> usize {
+    specific_or_legacy_capacity(RECENT_DECISION_CAPACITY.get())
+}
+
+pub(crate) fn profile_cache_capacity() -> usize {
+    specific_or_legacy_capacity(PROFILE_CACHE_CAPACITY.get())
+}
+
+pub(crate) fn budget_bucket_capacity() -> usize {
+    specific_or_legacy_capacity(BUDGET_BUCKET_CAPACITY.get())
+}
+
+pub(crate) fn composite_scope_enabled() -> bool {
+    COMPOSITE_SCOPE_ENABLED.get()
+}
+
+pub(crate) fn predictor_kind() -> PredictorKind {
+    PREDICTOR.get()
+}
+
 pub(crate) fn profile_ewma_alpha_weights() -> PwbResult<ProfileEwmaWeights> {
     alpha_to_profile_ewma_weights(PROFILE_EWMA_ALPHA.get())
 }
@@ -140,6 +236,14 @@ const fn nonnegative_i32_to_usize(value: i32) -> usize {
         0
     } else {
         value.cast_unsigned() as usize
+    }
+}
+
+fn specific_or_legacy_capacity(value: i32) -> usize {
+    if value == INHERIT_CAPACITY_VALUE {
+        shmem_capacity()
+    } else {
+        nonnegative_i32_to_usize(value)
     }
 }
 
@@ -188,6 +292,14 @@ mod tests {
     #[test]
     fn capacity_defaults_fit_usize() {
         assert_eq!(nonnegative_i32_to_usize(SHMEM_CAPACITY_VALUE), 4096);
+    }
+
+    #[test]
+    fn explicit_default_capacity_does_not_mean_inherit() {
+        assert_eq!(
+            nonnegative_i32_to_usize(SHMEM_CAPACITY_VALUE),
+            SHMEM_CAPACITY_VALUE as usize
+        );
     }
 
     #[test]

@@ -10,7 +10,9 @@ pub(super) struct SharedLayout {
     pub(super) recent_decisions_offset: usize,
     pub(super) profiles_offset: usize,
     pub(super) budget_buckets_offset: usize,
-    pub(super) capacity: usize,
+    pub(super) recent_decision_capacity: usize,
+    pub(super) profile_cache_capacity: usize,
+    pub(super) budget_bucket_capacity: usize,
 }
 
 impl SharedLayout {
@@ -20,35 +22,52 @@ impl SharedLayout {
             recent_decisions_offset: 0,
             profiles_offset: 0,
             budget_buckets_offset: 0,
-            capacity: 0,
+            recent_decision_capacity: 0,
+            profile_cache_capacity: 0,
+            budget_bucket_capacity: 0,
         }
     }
 }
 
-pub(super) fn compute_layout(capacity: usize) -> PwbResult<SharedLayout> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SharedCapacities {
+    pub(super) recent_decisions: usize,
+    pub(super) profiles: usize,
+    pub(super) budget_buckets: usize,
+}
+
+pub(super) fn compute_layout(capacities: SharedCapacities) -> PwbResult<SharedLayout> {
     let mut offset = size_of::<PwbSharedState>();
 
     offset = align_up(offset, align_of::<PwbRecentDecision>())?;
     let recent_decisions_offset = offset;
     offset = checked_add(
         offset,
-        checked_mul(capacity, size_of::<PwbRecentDecision>())?,
+        checked_mul(capacities.recent_decisions, size_of::<PwbRecentDecision>())?,
     )?;
 
     offset = align_up(offset, align_of::<PwbProfileEntry>())?;
     let profiles_offset = offset;
-    offset = checked_add(offset, checked_mul(capacity, size_of::<PwbProfileEntry>())?)?;
+    offset = checked_add(
+        offset,
+        checked_mul(capacities.profiles, size_of::<PwbProfileEntry>())?,
+    )?;
 
     offset = align_up(offset, align_of::<PwbBudgetBucket>())?;
     let budget_buckets_offset = offset;
-    offset = checked_add(offset, checked_mul(capacity, size_of::<PwbBudgetBucket>())?)?;
+    offset = checked_add(
+        offset,
+        checked_mul(capacities.budget_buckets, size_of::<PwbBudgetBucket>())?,
+    )?;
 
     Ok(SharedLayout {
         total_bytes: offset,
         recent_decisions_offset,
         profiles_offset,
         budget_buckets_offset,
-        capacity,
+        recent_decision_capacity: capacities.recent_decisions,
+        profile_cache_capacity: capacities.profiles,
+        budget_bucket_capacity: capacities.budget_buckets,
     })
 }
 
@@ -85,7 +104,12 @@ mod tests {
 
     #[test]
     fn computes_aligned_layout() {
-        let layout = compute_layout(5).unwrap_or_else(|error| panic!("{error}"));
+        let layout = compute_layout(SharedCapacities {
+            recent_decisions: 3,
+            profiles: 5,
+            budget_buckets: 7,
+        })
+        .unwrap_or_else(|error| panic!("{error}"));
 
         assert!(layout.total_bytes >= size_of::<PwbSharedState>());
         assert_eq!(
@@ -97,18 +121,34 @@ mod tests {
             layout.budget_buckets_offset % align_of::<PwbBudgetBucket>(),
             0
         );
-        assert_eq!(layout.capacity, 5);
+        assert_eq!(layout.recent_decision_capacity, 3);
+        assert_eq!(layout.profile_cache_capacity, 5);
+        assert_eq!(layout.budget_bucket_capacity, 7);
     }
 
     #[test]
     fn allows_zero_capacity_layout() {
-        let layout = compute_layout(0).unwrap_or_else(|error| panic!("{error}"));
+        let layout = compute_layout(SharedCapacities {
+            recent_decisions: 0,
+            profiles: 0,
+            budget_buckets: 0,
+        })
+        .unwrap_or_else(|error| panic!("{error}"));
 
-        assert_eq!(layout.capacity, 0);
+        assert_eq!(layout.recent_decision_capacity, 0);
+        assert_eq!(layout.profile_cache_capacity, 0);
+        assert_eq!(layout.budget_bucket_capacity, 0);
     }
 
     #[test]
     fn rejects_layout_overflow() {
-        assert!(compute_layout(usize::MAX).is_err());
+        assert!(
+            compute_layout(SharedCapacities {
+                recent_decisions: usize::MAX,
+                profiles: 0,
+                budget_buckets: 0,
+            })
+            .is_err()
+        );
     }
 }

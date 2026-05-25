@@ -257,7 +257,7 @@ fn upsert_query_profile_locked(
             state.profiles_len = state
                 .profiles_len
                 .saturating_add(1)
-                .min(state.shmem_capacity);
+                .min(state.profile_cache_capacity);
             slot
         } else {
             find_profile_eviction_slot(profiles).ok_or_else(profile_cache_capacity_exhausted)?
@@ -297,7 +297,7 @@ fn upsert_restored_query_profile_locked(
         state.profiles_len = state
             .profiles_len
             .saturating_add(1)
-            .min(state.shmem_capacity);
+            .min(state.profile_cache_capacity);
         slot
     } else {
         let eviction_slot =
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn upserts_profile_into_first_empty_slot() {
         let mut state = test_state(0);
-        state.shmem_capacity = 2;
+        state.profile_cache_capacity = 2;
         let mut profiles = [PwbProfileEntry::default(), PwbProfileEntry::default()];
 
         upsert_query_profile_locked(
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn upserts_existing_profile_with_ewma() {
         let mut state = test_state(0);
-        state.shmem_capacity = 1;
+        state.profile_cache_capacity = 1;
         state.profiles_len = 1;
         let mut profiles = [PwbProfileEntry::encode(
             Some(99),
@@ -456,7 +456,7 @@ mod tests {
     #[test]
     fn evicts_oldest_profile_when_capacity_is_full() {
         let mut state = test_state(0);
-        state.shmem_capacity = 2;
+        state.profile_cache_capacity = 2;
         state.profiles_len = 2;
         let mut profiles = [
             PwbProfileEntry::encode(Some(1), 1, PwbQueryWalProfile::from(profile(100, 10))),
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn batched_profile_upsert_with_capacity_one_keeps_one_profile() {
         let mut state = test_state(0);
-        state.shmem_capacity = 1;
+        state.profile_cache_capacity = 1;
         let mut profiles = [PwbProfileEntry::default()];
 
         upsert_scoped_and_global_query_profiles_locked(
@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn batched_profile_upsert_updates_scoped_and_global_entries_when_capacity_allows() {
         let mut state = test_state(0);
-        state.shmem_capacity = 2;
+        state.profile_cache_capacity = 2;
         let mut profiles = [PwbProfileEntry::default(), PwbProfileEntry::default()];
 
         upsert_scoped_and_global_query_profiles_locked(
@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn batched_profile_upsert_can_evict_twice_when_full() {
         let mut state = test_state(0);
-        state.shmem_capacity = 2;
+        state.profile_cache_capacity = 2;
         state.profiles_len = 2;
         let mut profiles = [
             PwbProfileEntry::encode(Some(1), 1, PwbQueryWalProfile::from(profile(100, 1))),

@@ -8,16 +8,22 @@ use crate::types::{EpochMillis, QueryId, QueryWalProfile, ScopeHash, StatementCl
 const PROFILE_PERSIST_INTERVAL_MS: EpochMillis = 60_000;
 const PROFILE_RESTORE_STALE_MS: EpochMillis = 60_000;
 
-pub(crate) fn predict(
-    statement_class: StatementClass,
-    query_id: Option<QueryId>,
-    scope_hash: ScopeHash,
-) -> WalBytes {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PredictionContext {
+    pub(crate) statement_class: StatementClass,
+    pub(crate) query_id: Option<QueryId>,
+    pub(crate) scope_hash: ScopeHash,
+}
+
+pub(crate) fn predict_context(context: &PredictionContext) -> WalBytes {
+    let statement_class = context.statement_class;
     if matches!(statement_class, StatementClass::ReadOnly) {
         return 0;
     }
 
-    if let Ok(Some(profile)) = lookup_prediction_profile(scope_hash, query_id) {
+    if matches!(guc::predictor_kind(), guc::PredictorKind::ProfileEwma)
+        && let Ok(Some(profile)) = lookup_prediction_profile(context.scope_hash, context.query_id)
+    {
         return clamp_prediction(profile.ewma_wal_bytes, guc::max_prediction_bytes());
     }
 
@@ -70,7 +76,7 @@ pub(crate) fn flush_profiles() -> PwbResult<()> {
 fn ensure_profiles_loaded() -> PwbResult<()> {
     let now_epoch_ms = time::current_epoch_ms();
     shmem::ensure_profiles_loaded(now_epoch_ms, PROFILE_RESTORE_STALE_MS, || {
-        profile_store::load_profiles(guc::shmem_capacity())
+        profile_store::load_profiles(guc::profile_cache_capacity())
     })
 }
 
@@ -111,7 +117,14 @@ mod tests {
 
     #[test]
     fn read_only_predicts_zero_without_shared_memory() {
-        assert_eq!(predict(StatementClass::ReadOnly, Some(42), 99), 0);
+        assert_eq!(
+            predict_context(&PredictionContext {
+                statement_class: StatementClass::ReadOnly,
+                query_id: Some(42),
+                scope_hash: 99,
+            }),
+            0
+        );
     }
 
     #[test]
