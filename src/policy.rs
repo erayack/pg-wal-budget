@@ -505,6 +505,16 @@ mod tests {
     }
 
     #[test]
+    fn validates_queue_policy_mode() {
+        let policy = match validate_policy_definition("role", None, 100, 500, " QUEUE ", 7) {
+            Ok(policy) => policy,
+            Err(error) => panic!("expected valid queue policy, got {error}"),
+        };
+
+        assert_eq!(policy.mode, BudgetMode::Queue);
+    }
+
+    #[test]
     fn normalizes_empty_scope_value_to_none() {
         let policy = match validate_policy_definition("database", Some("   "), 1, 1, "observe", 100)
         {

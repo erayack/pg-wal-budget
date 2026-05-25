@@ -2,7 +2,7 @@
 
 A Rust/pgrx PostgreSQL 17 extension that observes, predicts, and optionally enforces WAL-generation budgets by policy scope.
 
-Hooks (executor + utility) and shared-memory state are installed from `_PG_init`. SQL functions live in the `pwb` schema. MVP status: observe / shadow / reject modes, durable policies, scope classification by tenant → role → database → `application_name`, optional composite scopes, and exact backend-local WAL telemetry where PostgreSQL exposes `pgWalUsage`. Unsupported targets mark actual WAL telemetry unavailable. No queue/wait mode, no cross-node coordination, no replica-lag throttling yet.
+Hooks (executor + utility) and shared-memory state are installed from `_PG_init`. SQL functions live in the `pwb` schema. MVP status: observe / shadow / reject / queue modes, durable policies, scope classification by tenant → role → database → `application_name`, optional composite scopes, and exact backend-local WAL telemetry where PostgreSQL exposes `pgWalUsage`. Unsupported targets mark actual WAL telemetry unavailable. No cross-node coordination or replica-lag throttling yet.
 
 ## Install
 
@@ -45,18 +45,21 @@ select * from pwb.scope_stats();
 select * from pwb.recent_decisions(100) order by timestamp_epoch_ms desc;
 ```
 
-Promote a policy through the rollout stages (`observe` → `shadow` → `reject`) once predictions look stable:
+Promote a policy through the rollout stages once predictions look stable. Use `queue` when a backend should wait briefly for budget instead of returning an immediate error:
 
 ```sql
 select pwb.set_policy_mode(1, 'shadow');
 select pwb.update_policy(1, 2097152, 16777216);
+select pwb.set_policy_mode(1, 'queue');
 select pwb.set_policy_mode(1, 'reject');
 select pwb.disable_policy(1);
 ```
 
 ## Policies
 
-- Modes: `off`, `observe`, `shadow`, `reject`.
+- Modes: `off`, `observe`, `shadow`, `queue`, `reject`.
+- `queue` blocks the backend before execution until enough WAL budget can be charged. If the predicted WAL bytes exceed the policy burst, the statement is rejected because it can never fit in the bucket.
+- Queue waits sleep in bounded chunks and check PostgreSQL interrupts between chunks, so query cancellation is observed before the statement starts with up to roughly 100 ms of sleep latency.
 - Scope kinds: `tenant`, `role`, `database`, `application`, `composite`.
 - Matching: highest `priority` wins; ties resolved by lowest `policy_id`.
 - Tenant scope is trusted backend-local state; set via `pwb.set_tenant(...)` / `pwb.clear_tenant()`. Restricted to superusers and members of `pwb_tenant_setter`.

@@ -12,6 +12,7 @@ pub(crate) enum BudgetMode {
     Observe,
     Shadow,
     Reject,
+    Queue,
 }
 
 impl BudgetMode {
@@ -21,6 +22,7 @@ impl BudgetMode {
             Self::Observe => "observe",
             Self::Shadow => "shadow",
             Self::Reject => "reject",
+            Self::Queue => "queue",
         }
     }
 
@@ -30,6 +32,7 @@ impl BudgetMode {
             "observe" => Ok(Self::Observe),
             "shadow" => Ok(Self::Shadow),
             "reject" => Ok(Self::Reject),
+            "queue" => Ok(Self::Queue),
             _ => Err(PwbError::InvalidBudgetMode {
                 value: input.to_string(),
             }),
@@ -349,6 +352,7 @@ mod tests {
         assert_eq!(BudgetMode::parse_sql(" OBSERVE "), Ok(BudgetMode::Observe));
         assert_eq!(BudgetMode::parse_sql("shadow"), Ok(BudgetMode::Shadow));
         assert_eq!(BudgetMode::parse_sql("reject"), Ok(BudgetMode::Reject));
+        assert_eq!(BudgetMode::parse_sql("queue"), Ok(BudgetMode::Queue));
 
         assert!(matches!(
             BudgetMode::parse_sql("enforce"),
@@ -362,6 +366,7 @@ mod tests {
         assert_eq!(BudgetMode::Observe.as_sql_str(), "observe");
         assert_eq!(BudgetMode::Shadow.as_sql_str(), "shadow");
         assert_eq!(BudgetMode::Reject.as_sql_str(), "reject");
+        assert_eq!(BudgetMode::Queue.as_sql_str(), "queue");
     }
 
     #[test]

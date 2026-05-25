@@ -11,7 +11,7 @@ create table pwb.policy (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint policy_mode_check
-    check (mode in ('off', 'observe', 'shadow', 'reject')),
+    check (mode in ('off', 'observe', 'shadow', 'reject', 'queue')),
   constraint policy_scope_kind_check
     check (scope_kind in ('database', 'role', 'application', 'tenant', 'composite')),
   constraint policy_rate_positive_check

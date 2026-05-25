@@ -1,5 +1,6 @@
 use crate::errors::{PwbError, PwbResult};
 use crate::shmem::{self, BudgetBucketState};
+use crate::time;
 use crate::types::{
     AdmissionContext, AdmissionDecision, BudgetMode, EpochMillis, PolicyId, ReasonCode, ScopeHash,
     WalBytes,
@@ -18,6 +19,20 @@ pub(crate) struct EffectivePolicy {
 struct RefillResult {
     available_bytes: WalBytes,
     last_refill_epoch_ms: EpochMillis,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueueWait {
+    policy_id: PolicyId,
+    predicted_wal_bytes: WalBytes,
+    available_wal_bytes: WalBytes,
+    wait_ms: EpochMillis,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChargeAttempt {
+    Admitted(AdmissionDecision),
+    WouldWait(QueueWait),
 }
 
 pub(crate) fn admit_statement(
@@ -47,6 +62,7 @@ pub(crate) fn admit_statement(
             || initial_bucket_state(policy, context.scope.value_hash, now_epoch_ms),
             |bucket| admit_with_bucket(context.predicted_wal_bytes, policy, now_epoch_ms, bucket),
         ),
+        BudgetMode::Queue => admit_queue_statement(context, policy, now_epoch_ms),
         BudgetMode::Off | BudgetMode::Observe => unreachable!("handled before bucket admission"),
     }
 }
@@ -158,23 +174,111 @@ fn admit_with_bucket(
             Ok(decision.with_availability(available_before, bucket.available_bytes))
         }
         BudgetMode::Reject => {
-            if !can_afford(available_before, predicted_wal_bytes) {
-                return Err(PwbError::BudgetExceeded {
-                    policy_id: policy.policy_id,
-                    predicted_wal_bytes,
-                    available_wal_bytes: available_before,
-                });
-            }
-
-            bucket.available_bytes = charge_available(available_before, predicted_wal_bytes);
-            Ok(AdmissionDecision::allowed(
-                Some(policy.policy_id),
-                predicted_wal_bytes,
-                ReasonCode::BudgetAvailable,
-            )
-            .with_availability(available_before, bucket.available_bytes))
+            admit_charge_attempt(predicted_wal_bytes, policy, available_before, bucket)
+                .and_then(charge_attempt_to_reject_decision)
         }
-        BudgetMode::Off | BudgetMode::Observe => unreachable!("handled before bucket admission"),
+        BudgetMode::Off | BudgetMode::Observe | BudgetMode::Queue => {
+            unreachable!("handled before single-shot bucket admission")
+        }
+    }
+}
+
+fn admit_queue_statement(
+    context: &AdmissionContext,
+    policy: &EffectivePolicy,
+    mut now_epoch_ms: EpochMillis,
+) -> PwbResult<AdmissionDecision> {
+    if context.predicted_wal_bytes > policy.wal_burst_bytes {
+        return Err(PwbError::BudgetExceeded {
+            policy_id: policy.policy_id,
+            predicted_wal_bytes: context.predicted_wal_bytes,
+            available_wal_bytes: policy.wal_burst_bytes,
+        });
+    }
+
+    loop {
+        let attempt = shmem::with_budget_bucket(
+            policy.policy_id,
+            context.scope.value_hash,
+            || initial_bucket_state(policy, context.scope.value_hash, now_epoch_ms),
+            |bucket| {
+                refresh_and_attempt_charge(
+                    context.predicted_wal_bytes,
+                    policy,
+                    now_epoch_ms,
+                    bucket,
+                )
+            },
+        )?;
+
+        match attempt {
+            ChargeAttempt::Admitted(decision) => return Ok(decision),
+            ChargeAttempt::WouldWait(wait) => {
+                time::sleep_ms_interruptible(wait.wait_ms);
+                now_epoch_ms = time::current_epoch_ms();
+            }
+        }
+    }
+}
+
+fn refresh_and_attempt_charge(
+    predicted_wal_bytes: WalBytes,
+    policy: &EffectivePolicy,
+    now_epoch_ms: EpochMillis,
+    bucket: &mut BudgetBucketState,
+) -> PwbResult<ChargeAttempt> {
+    refresh_bucket_policy(bucket, policy);
+
+    let refilled = refill_available_bytes(
+        bucket.available_bytes,
+        bucket.max_burst_bytes,
+        bucket.rate_bytes_per_sec,
+        bucket.last_refill_epoch_ms,
+        now_epoch_ms,
+    );
+    bucket.available_bytes = refilled.available_bytes;
+    bucket.last_refill_epoch_ms = refilled.last_refill_epoch_ms;
+
+    admit_charge_attempt(predicted_wal_bytes, policy, bucket.available_bytes, bucket)
+}
+
+fn admit_charge_attempt(
+    predicted_wal_bytes: WalBytes,
+    policy: &EffectivePolicy,
+    available_before: WalBytes,
+    bucket: &mut BudgetBucketState,
+) -> PwbResult<ChargeAttempt> {
+    if !can_afford(available_before, predicted_wal_bytes) {
+        return Ok(ChargeAttempt::WouldWait(QueueWait {
+            policy_id: policy.policy_id,
+            predicted_wal_bytes,
+            available_wal_bytes: available_before,
+            wait_ms: wait_ms_for_deficit(
+                predicted_wal_bytes - available_before,
+                policy.wal_rate_bytes_per_sec,
+            )?,
+        }));
+    }
+
+    bucket.available_bytes = charge_available(available_before, predicted_wal_bytes);
+    Ok(ChargeAttempt::Admitted(
+        AdmissionDecision::allowed(
+            Some(policy.policy_id),
+            predicted_wal_bytes,
+            ReasonCode::BudgetAvailable,
+        )
+        .with_availability(available_before, bucket.available_bytes),
+    ))
+}
+
+const fn charge_attempt_to_reject_decision(attempt: ChargeAttempt) -> PwbResult<AdmissionDecision> {
+    match attempt {
+        ChargeAttempt::Admitted(decision) => Ok(decision),
+        ChargeAttempt::WouldWait(wait) => Err(PwbError::BudgetExceeded {
+            policy_id: wait.policy_id,
+            predicted_wal_bytes: wait.predicted_wal_bytes,
+            available_wal_bytes: wait.available_wal_bytes,
+        }),
     }
 }
 
@@ -225,6 +329,22 @@ const fn charge_available(available: WalBytes, predicted: WalBytes) -> WalBytes 
 
 fn refund_available(available: WalBytes, max_burst: WalBytes, refund: WalBytes) -> WalBytes {
     available.saturating_add(refund).min(max_burst)
+}
+
+fn wait_ms_for_deficit(deficit: WalBytes, rate_per_sec: WalBytes) -> PwbResult<EpochMillis> {
+    if deficit == 0 {
+        return Ok(0);
+    }
+
+    if rate_per_sec == 0 {
+        return Err(PwbError::Internal {
+            message: "queue policy has zero WAL refill rate".to_string(),
+        });
+    }
+
+    let numerator = u128::from(deficit) * 1000;
+    let wait_ms = numerator.div_ceil(u128::from(rate_per_sec));
+    Ok(EpochMillis::try_from(wait_ms).unwrap_or(EpochMillis::MAX))
 }
 
 #[cfg(test)]
@@ -420,5 +540,75 @@ mod tests {
             }
         );
         assert_eq!(bucket.available_bytes, 1000);
+    }
+
+    #[test]
+    fn queue_under_budget_charges_prediction() {
+        let mut bucket = bucket(3000);
+        let attempt =
+            refresh_and_attempt_charge(2000, &policy(BudgetMode::Queue), 1000, &mut bucket)
+                .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(
+            attempt,
+            ChargeAttempt::Admitted(
+                AdmissionDecision::allowed(Some(POLICY_ID), 2000, ReasonCode::BudgetAvailable)
+                    .with_availability(3000, 1000)
+            )
+        );
+        assert_eq!(bucket.available_bytes, 1000);
+    }
+
+    #[test]
+    fn queue_over_budget_reports_wait_without_decrementing() {
+        let mut bucket = bucket(1000);
+        let attempt =
+            refresh_and_attempt_charge(2000, &policy(BudgetMode::Queue), 1000, &mut bucket)
+                .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(
+            attempt,
+            ChargeAttempt::WouldWait(QueueWait {
+                policy_id: POLICY_ID,
+                predicted_wal_bytes: 2000,
+                available_wal_bytes: 1000,
+                wait_ms: 1000,
+            })
+        );
+        assert_eq!(bucket.available_bytes, 1000);
+    }
+
+    #[test]
+    fn queue_rejects_predictions_that_exceed_burst_before_bucket_access() {
+        let error = match admit_queue_statement(&context(6000), &policy(BudgetMode::Queue), 1000) {
+            Ok(admission) => panic!("expected budget exceeded, got {admission:?}"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            PwbError::BudgetExceeded {
+                policy_id: POLICY_ID,
+                predicted_wal_bytes: 6000,
+                available_wal_bytes: 5000,
+            }
+        );
+    }
+
+    #[test]
+    fn wait_ms_for_deficit_rounds_up_fractional_milliseconds() {
+        let wait_ms = wait_ms_for_deficit(1, 3).unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(wait_ms, 334);
+    }
+
+    #[test]
+    fn wait_ms_for_deficit_rejects_zero_rate() {
+        let error = match wait_ms_for_deficit(1, 0) {
+            Ok(wait_ms) => panic!("expected error, got {wait_ms}"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, PwbError::Internal { .. }));
     }
 }
