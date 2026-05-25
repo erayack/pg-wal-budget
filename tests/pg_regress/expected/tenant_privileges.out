@@ -40,6 +40,15 @@ end;
 $$;
 do $$
 begin
+  perform pwb.update_policy(1, 1000, 2000);
+  raise exception 'expected update policy to fail';
+exception
+  when insufficient_privilege then
+    raise notice 'update policy rejected';
+end;
+$$;
+do $$
+begin
   perform pwb.disable_policy(1);
   raise exception 'expected disable policy to fail';
 exception
@@ -93,6 +102,12 @@ select pwb.set_policy_mode(1, 'shadow');
  set_policy_mode 
 -----------------
  
+(1 row)
+
+select pwb.update_policy(1, 2000, 4000, 20) is null as t;
+ t 
+---
+ f
 (1 row)
 
 select pwb.disable_policy(1);

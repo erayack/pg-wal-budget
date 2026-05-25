@@ -41,6 +41,15 @@ end;
 $$;
 do $$
 begin
+  perform pwb.update_policy(1, 1000, 2000);
+  raise exception 'expected update policy to fail';
+exception
+  when insufficient_privilege then
+    raise notice 'update policy rejected';
+end;
+$$;
+do $$
+begin
   perform pwb.disable_policy(1);
   raise exception 'expected disable policy to fail';
 exception
@@ -80,6 +89,7 @@ grant pwb_admin to pwb_regress_admin;
 set role pwb_regress_admin;
 select pwb.create_policy('role', current_user, 1000, 2000, 'observe', 10) is not null as admin_created_policy;
 select pwb.set_policy_mode(1, 'shadow');
+select pwb.update_policy(1, 2000, 4000, 20) is null as t;
 select pwb.disable_policy(1);
 select pwb.reset_stats();
 select pwb.reset_profiles();

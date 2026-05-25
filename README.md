@@ -49,6 +49,7 @@ Promote a policy through the rollout stages (`observe` → `shadow` → `reject`
 
 ```sql
 select pwb.set_policy_mode(1, 'shadow');
+select pwb.update_policy(1, 2097152, 16777216);
 select pwb.set_policy_mode(1, 'reject');
 select pwb.disable_policy(1);
 ```

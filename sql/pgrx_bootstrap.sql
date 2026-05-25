@@ -77,6 +77,16 @@ language c
 security definer
 as 'MODULE_PATHNAME', 'pwb_set_policy_mode_wrapper';
 
+create function pwb.update_policy(
+  policy_id integer,
+  wal_rate_bytes_per_sec bigint,
+  wal_burst_bytes bigint,
+  priority integer default null
+) returns void
+language c
+security definer
+as 'MODULE_PATHNAME', 'pwb_update_policy_wrapper';
+
 create function pwb.disable_policy(policy_id integer)
 returns void
 language c
@@ -248,9 +258,11 @@ grant select on pwb.active_policy_precedence to pwb_admin, pwb_monitor;
 
 revoke all on function pwb.create_policy(text, text, bigint, bigint, text, integer) from public;
 revoke all on function pwb.set_policy_mode(integer, text) from public;
+revoke all on function pwb.update_policy(integer, bigint, bigint, integer) from public;
 revoke all on function pwb.disable_policy(integer) from public;
 grant execute on function pwb.create_policy(text, text, bigint, bigint, text, integer) to pwb_admin;
 grant execute on function pwb.set_policy_mode(integer, text) to pwb_admin;
+grant execute on function pwb.update_policy(integer, bigint, bigint, integer) to pwb_admin;
 grant execute on function pwb.disable_policy(integer) to pwb_admin;
 
 revoke all on function pwb.set_tenant(text) from public;

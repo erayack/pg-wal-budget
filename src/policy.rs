@@ -29,6 +29,12 @@ pub(crate) struct PolicyDefinition {
     pub(crate) priority: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PolicyBudgetUpdate {
+    wal_rate_bytes_per_sec: WalBytes,
+    wal_burst_bytes: WalBytes,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CachedEffectivePolicy {
     scope_kind: ScopeKind,
@@ -52,25 +58,15 @@ pub(crate) fn validate_policy_definition(
 ) -> PwbResult<PolicyDefinition> {
     let mode = BudgetMode::parse_sql(mode)?;
     let scope_kind = ScopeKind::parse_sql(scope_kind)?;
-    let wal_rate_bytes_per_sec =
-        validate_positive_wal_bytes("wal_rate_bytes_per_sec", wal_rate_bytes_per_sec)?;
-    let wal_burst_bytes = validate_positive_wal_bytes("wal_burst_bytes", wal_burst_bytes)?;
-
-    if wal_burst_bytes < wal_rate_bytes_per_sec {
-        return Err(PwbError::InvalidPolicyValue {
-            field: "wal_burst_bytes",
-            value: wal_burst_bytes.to_string(),
-            reason: "must be greater than or equal to wal_rate_bytes_per_sec",
-        });
-    }
+    let budget = validate_policy_budget_update(wal_rate_bytes_per_sec, wal_burst_bytes)?;
 
     Ok(PolicyDefinition {
         enabled: true,
         mode,
         scope_kind,
         scope_value: normalize_scope_value(scope_value),
-        wal_rate_bytes_per_sec,
-        wal_burst_bytes,
+        wal_rate_bytes_per_sec: budget.wal_rate_bytes_per_sec,
+        wal_burst_bytes: budget.wal_burst_bytes,
         priority,
     })
 }
@@ -158,6 +154,7 @@ fn load_policy_cache(now_epoch_ms: EpochMillis) -> PwbResult<PolicyCache> {
                 "wal_burst_bytes",
                 row.get_by_name::<i64, _>("wal_burst_bytes"),
             )?;
+            let budget = validate_policy_budget_update(wal_rate_bytes_per_sec, wal_burst_bytes)?;
 
             policies.push(CachedEffectivePolicy {
                 scope_kind: ScopeKind::parse_sql(&scope_kind)?,
@@ -166,14 +163,8 @@ fn load_policy_cache(now_epoch_ms: EpochMillis) -> PwbResult<PolicyCache> {
                     policy_id,
                     enabled,
                     mode: BudgetMode::parse_sql(&mode)?,
-                    wal_rate_bytes_per_sec: validate_positive_wal_bytes(
-                        "wal_rate_bytes_per_sec",
-                        wal_rate_bytes_per_sec,
-                    )?,
-                    wal_burst_bytes: validate_positive_wal_bytes(
-                        "wal_burst_bytes",
-                        wal_burst_bytes,
-                    )?,
+                    wal_rate_bytes_per_sec: budget.wal_rate_bytes_per_sec,
+                    wal_burst_bytes: budget.wal_burst_bytes,
                 },
             });
         }
@@ -245,6 +236,19 @@ fn pwb_set_policy_mode(policy_id: i32, mode: &str) {
     privileges::require(PrivilegeGate::Admin, "set pg_wal_budget policy mode")
         .unwrap_or_else(errors::raise);
     set_policy_mode_impl(policy_id, mode).unwrap_or_else(errors::raise);
+}
+
+#[pg_extern]
+fn pwb_update_policy(
+    policy_id: i32,
+    wal_rate_bytes_per_sec: i64,
+    wal_burst_bytes: i64,
+    priority: default!(Option<i32>, "NULL"),
+) {
+    privileges::require(PrivilegeGate::Admin, "update pg_wal_budget policy")
+        .unwrap_or_else(errors::raise);
+    update_policy_impl(policy_id, wal_rate_bytes_per_sec, wal_burst_bytes, priority)
+        .unwrap_or_else(errors::raise);
 }
 
 #[pg_extern]
@@ -335,6 +339,44 @@ fn set_policy_mode_impl(policy_id: PolicyId, mode: &str) -> PwbResult<()> {
     Ok(())
 }
 
+fn update_policy_impl(
+    policy_id: PolicyId,
+    wal_rate_bytes_per_sec: i64,
+    wal_burst_bytes: i64,
+    priority: Option<i32>,
+) -> PwbResult<()> {
+    let budget = validate_policy_budget_update(wal_rate_bytes_per_sec, wal_burst_bytes)?;
+    let rate = wal_bytes_to_i64("wal_rate_bytes_per_sec", budget.wal_rate_bytes_per_sec)?;
+    let burst = wal_bytes_to_i64("wal_burst_bytes", budget.wal_burst_bytes)?;
+
+    let updated = hooks::with_admission_bypass(|| {
+        Spi::get_one_with_args::<bool>(
+            "
+        with updated as (
+        update pwb.policy
+           set wal_rate_bytes_per_sec = $2,
+               wal_burst_bytes = $3,
+               priority = coalesce($4, priority)
+         where policy_id = $1
+        returning true
+        )
+        select exists (select 1 from updated)
+        ",
+            &[
+                policy_id.into(),
+                rate.into(),
+                burst.into(),
+                nullable_i32_arg(priority),
+            ],
+        )
+    })
+    .map_err(spi_error)?;
+
+    require_policy_updated(policy_id, updated)?;
+    invalidate_backend_policy_cache();
+    Ok(())
+}
+
 fn disable_policy_impl(policy_id: PolicyId) -> PwbResult<()> {
     let updated = hooks::with_admission_bypass(|| {
         Spi::get_one_with_args::<bool>(
@@ -355,6 +397,28 @@ fn disable_policy_impl(policy_id: PolicyId) -> PwbResult<()> {
     require_policy_updated(policy_id, updated)?;
     invalidate_backend_policy_cache();
     Ok(())
+}
+
+fn validate_policy_budget_update(
+    wal_rate_bytes_per_sec: i64,
+    wal_burst_bytes: i64,
+) -> PwbResult<PolicyBudgetUpdate> {
+    let wal_rate_bytes_per_sec =
+        validate_positive_wal_bytes("wal_rate_bytes_per_sec", wal_rate_bytes_per_sec)?;
+    let wal_burst_bytes = validate_positive_wal_bytes("wal_burst_bytes", wal_burst_bytes)?;
+
+    if wal_burst_bytes < wal_rate_bytes_per_sec {
+        return Err(PwbError::InvalidPolicyValue {
+            field: "wal_burst_bytes",
+            value: wal_burst_bytes.to_string(),
+            reason: "must be greater than or equal to wal_rate_bytes_per_sec",
+        });
+    }
+
+    Ok(PolicyBudgetUpdate {
+        wal_rate_bytes_per_sec,
+        wal_burst_bytes,
+    })
 }
 
 fn validate_positive_wal_bytes(field: &'static str, value: i64) -> PwbResult<WalBytes> {
@@ -390,6 +454,10 @@ fn normalize_scope_value(scope_value: Option<&str>) -> Option<String> {
 
 fn nullable_text_arg(value: Option<&str>) -> DatumWithOid<'_> {
     value.map_or_else(DatumWithOid::null::<String>, DatumWithOid::from)
+}
+
+fn nullable_i32_arg(value: Option<i32>) -> DatumWithOid<'static> {
+    value.map_or_else(DatumWithOid::null::<i32>, DatumWithOid::from)
 }
 
 fn require_policy_updated(policy_id: PolicyId, updated: Option<bool>) -> PwbResult<()> {

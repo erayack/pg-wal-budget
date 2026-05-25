@@ -20,6 +20,30 @@ order by policy_id;
 select pwb.set_policy_mode(1, 'reject');
 select policy_id, mode from pwb.policy where policy_id = 1;
 
+select
+  pwb.update_policy(1, 3000, 6000, 150) is null as t;
+select
+  exists (
+    select 1
+    from pwb.policy
+    where policy_id = 1
+      and wal_rate_bytes_per_sec = 3000
+      and wal_burst_bytes = 6000
+      and priority = 150
+  ) as t;
+
+select
+  pwb.update_policy(1, 4000, 8000, null) is null as t;
+select
+  exists (
+    select 1
+    from pwb.policy
+    where policy_id = 1
+      and wal_rate_bytes_per_sec = 4000
+      and wal_burst_bytes = 8000
+      and priority = 150
+  ) as t;
+
 select pwb.disable_policy(2);
 select policy_id, enabled from pwb.policy where policy_id = 2;
 
@@ -78,6 +102,36 @@ begin
 exception
   when invalid_parameter_value then
     raise notice 'missing policy rejected';
+end;
+$$;
+
+do $$
+begin
+  perform pwb.update_policy(1, 0, 2000);
+  raise exception 'expected zero update rate to fail';
+exception
+  when invalid_parameter_value then
+    raise notice 'zero update rate rejected';
+end;
+$$;
+
+do $$
+begin
+  perform pwb.update_policy(1, 2000, 1000);
+  raise exception 'expected update burst below rate to fail';
+exception
+  when invalid_parameter_value then
+    raise notice 'update burst below rate rejected';
+end;
+$$;
+
+do $$
+begin
+  perform pwb.update_policy(999, 1000, 2000);
+  raise exception 'expected missing update policy to fail';
+exception
+  when invalid_parameter_value then
+    raise notice 'missing update policy rejected';
 end;
 $$;
 
