@@ -186,7 +186,7 @@ fn admit_with_bucket(
 fn admit_queue_statement(
     context: &AdmissionContext,
     policy: &EffectivePolicy,
-    mut now_epoch_ms: EpochMillis,
+    now_epoch_ms: EpochMillis,
 ) -> PwbResult<AdmissionDecision> {
     if context.predicted_wal_bytes > policy.wal_burst_bytes {
         return Err(PwbError::BudgetExceeded {
@@ -196,26 +196,42 @@ fn admit_queue_statement(
         });
     }
 
+    admit_queue_with_retry(
+        now_epoch_ms,
+        |now_epoch_ms| {
+            shmem::with_budget_bucket(
+                policy.policy_id,
+                context.scope.value_hash,
+                || initial_bucket_state(policy, context.scope.value_hash, now_epoch_ms),
+                |bucket| {
+                    refresh_and_attempt_charge(
+                        context.predicted_wal_bytes,
+                        policy,
+                        now_epoch_ms,
+                        bucket,
+                    )
+                },
+            )
+        },
+        time::sleep_ms_interruptible,
+        time::current_epoch_ms,
+    )
+}
+
+fn admit_queue_with_retry(
+    mut now_epoch_ms: EpochMillis,
+    mut attempt_charge: impl FnMut(EpochMillis) -> PwbResult<ChargeAttempt>,
+    mut sleep_ms: impl FnMut(EpochMillis),
+    mut current_epoch_ms: impl FnMut() -> EpochMillis,
+) -> PwbResult<AdmissionDecision> {
     loop {
-        let attempt = shmem::with_budget_bucket(
-            policy.policy_id,
-            context.scope.value_hash,
-            || initial_bucket_state(policy, context.scope.value_hash, now_epoch_ms),
-            |bucket| {
-                refresh_and_attempt_charge(
-                    context.predicted_wal_bytes,
-                    policy,
-                    now_epoch_ms,
-                    bucket,
-                )
-            },
-        )?;
+        let attempt = attempt_charge(now_epoch_ms)?;
 
         match attempt {
             ChargeAttempt::Admitted(decision) => return Ok(decision),
             ChargeAttempt::WouldWait(wait) => {
-                time::sleep_ms_interruptible(wait.wait_ms);
-                now_epoch_ms = time::current_epoch_ms();
+                sleep_ms(wait.wait_ms);
+                now_epoch_ms = current_epoch_ms();
             }
         }
     }
@@ -576,6 +592,51 @@ mod tests {
             })
         );
         assert_eq!(bucket.available_bytes, 1000);
+    }
+
+    #[test]
+    fn queue_wait_retry_eventually_charges_after_sleep_and_time_advance() {
+        let mut attempt_timestamps = Vec::new();
+        let mut sleep_calls = Vec::new();
+        let mut attempt_count = 0;
+
+        let admission = admit_queue_with_retry(
+            1000,
+            |now_epoch_ms| {
+                attempt_count += 1;
+                attempt_timestamps.push(now_epoch_ms);
+
+                if attempt_count == 1 {
+                    Ok(ChargeAttempt::WouldWait(QueueWait {
+                        policy_id: POLICY_ID,
+                        predicted_wal_bytes: 2000,
+                        available_wal_bytes: 1000,
+                        wait_ms: 1000,
+                    }))
+                } else {
+                    Ok(ChargeAttempt::Admitted(
+                        AdmissionDecision::allowed(
+                            Some(POLICY_ID),
+                            2000,
+                            ReasonCode::BudgetAvailable,
+                        )
+                        .with_availability(2000, 0),
+                    ))
+                }
+            },
+            |wait_ms| sleep_calls.push(wait_ms),
+            || 2000,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(
+            admission,
+            AdmissionDecision::allowed(Some(POLICY_ID), 2000, ReasonCode::BudgetAvailable)
+                .with_availability(2000, 0)
+        );
+        assert_eq!(attempt_timestamps, vec![1000, 2000]);
+        assert_eq!(sleep_calls, vec![1000]);
+        assert_eq!(attempt_count, 2);
     }
 
     #[test]

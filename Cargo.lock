@@ -926,6 +926,7 @@ version = "0.2.0"
 dependencies = [
  "pgrx",
  "pgrx-tests",
+ "postgres",
  "serde",
 ]
 
