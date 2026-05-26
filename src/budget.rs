@@ -29,10 +29,11 @@ struct QueueWait {
     wait_ms: EpochMillis,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum ChargeAttempt {
     Admitted(AdmissionDecision),
     WouldWait(QueueWait),
+    Failed(PwbError),
 }
 
 pub(crate) fn admit_statement(
@@ -60,7 +61,9 @@ pub(crate) fn admit_statement(
             policy.policy_id,
             context.scope.value_hash,
             || initial_bucket_state(policy, context.scope.value_hash, now_epoch_ms),
-            |bucket| admit_with_bucket(context.predicted_wal_bytes, policy, now_epoch_ms, bucket),
+            |bucket| {
+                admit_reject_with_bucket(context.predicted_wal_bytes, policy, now_epoch_ms, bucket)
+            },
         ),
         BudgetMode::Queue => admit_queue_statement(context, policy, now_epoch_ms),
         BudgetMode::Off | BudgetMode::Observe => unreachable!("handled before bucket admission"),
@@ -118,14 +121,29 @@ fn admit_shadow_statement(
     now_epoch_ms: EpochMillis,
 ) -> PwbResult<AdmissionDecision> {
     if !shmem::is_available() {
-        return admit_shadow_with_ephemeral_bucket(context, policy, now_epoch_ms);
+        return Ok(admit_shadow_with_ephemeral_bucket(
+            context,
+            policy,
+            now_epoch_ms,
+        ));
     }
 
     shmem::with_existing_budget_bucket(policy.policy_id, context.scope.value_hash, |bucket| {
-        admit_with_bucket(context.predicted_wal_bytes, policy, now_epoch_ms, bucket)
+        Ok(admit_shadow_with_bucket(
+            context.predicted_wal_bytes,
+            policy,
+            now_epoch_ms,
+            bucket,
+        ))
     })?
     .map_or_else(
-        || admit_shadow_with_ephemeral_bucket(context, policy, now_epoch_ms),
+        || {
+            Ok(admit_shadow_with_ephemeral_bucket(
+                context,
+                policy,
+                now_epoch_ms,
+            ))
+        },
         Ok,
     )
 }
@@ -134,9 +152,9 @@ fn admit_shadow_with_ephemeral_bucket(
     context: &AdmissionContext,
     policy: &EffectivePolicy,
     now_epoch_ms: EpochMillis,
-) -> PwbResult<AdmissionDecision> {
+) -> AdmissionDecision {
     let mut bucket = initial_bucket_state(policy, context.scope.value_hash, now_epoch_ms);
-    admit_with_bucket(
+    admit_shadow_with_bucket(
         context.predicted_wal_bytes,
         policy,
         now_epoch_ms,
@@ -144,43 +162,35 @@ fn admit_shadow_with_ephemeral_bucket(
     )
 }
 
-fn admit_with_bucket(
+fn admit_shadow_with_bucket(
+    predicted_wal_bytes: WalBytes,
+    policy: &EffectivePolicy,
+    now_epoch_ms: EpochMillis,
+    bucket: &mut BudgetBucketState,
+) -> AdmissionDecision {
+    let available_before = refresh_bucket(policy, now_epoch_ms, bucket);
+    let decision = if can_afford(available_before, predicted_wal_bytes) {
+        AdmissionDecision::allowed(Some(policy.policy_id), 0, ReasonCode::ShadowMode)
+    } else {
+        AdmissionDecision::would_reject(policy.policy_id, predicted_wal_bytes)
+    };
+
+    decision.with_availability(available_before, bucket.available_bytes)
+}
+
+fn admit_reject_with_bucket(
     predicted_wal_bytes: WalBytes,
     policy: &EffectivePolicy,
     now_epoch_ms: EpochMillis,
     bucket: &mut BudgetBucketState,
 ) -> PwbResult<AdmissionDecision> {
-    refresh_bucket_policy(bucket, policy);
-
-    let refilled = refill_available_bytes(
-        bucket.available_bytes,
-        bucket.max_burst_bytes,
-        bucket.rate_bytes_per_sec,
-        bucket.last_refill_epoch_ms,
-        now_epoch_ms,
-    );
-    bucket.available_bytes = refilled.available_bytes;
-    bucket.last_refill_epoch_ms = refilled.last_refill_epoch_ms;
-
-    let available_before = bucket.available_bytes;
-
-    match policy.mode {
-        BudgetMode::Shadow => {
-            let decision = if can_afford(available_before, predicted_wal_bytes) {
-                AdmissionDecision::allowed(Some(policy.policy_id), 0, ReasonCode::ShadowMode)
-            } else {
-                AdmissionDecision::would_reject(policy.policy_id, predicted_wal_bytes)
-            };
-            Ok(decision.with_availability(available_before, bucket.available_bytes))
-        }
-        BudgetMode::Reject => {
-            admit_charge_attempt(predicted_wal_bytes, policy, available_before, bucket)
-                .and_then(charge_attempt_to_reject_decision)
-        }
-        BudgetMode::Off | BudgetMode::Observe | BudgetMode::Queue => {
-            unreachable!("handled before single-shot bucket admission")
-        }
-    }
+    let available_before = refresh_bucket(policy, now_epoch_ms, bucket);
+    charge_attempt_to_reject_decision(try_charge(
+        policy.policy_id,
+        predicted_wal_bytes,
+        available_before,
+        bucket,
+    ))
 }
 
 fn admit_queue_statement(
@@ -204,7 +214,7 @@ fn admit_queue_statement(
                 context.scope.value_hash,
                 || initial_bucket_state(policy, context.scope.value_hash, now_epoch_ms),
                 |bucket| {
-                    refresh_and_attempt_charge(
+                    attempt_queue_charge_result(
                         context.predicted_wal_bytes,
                         policy,
                         now_epoch_ms,
@@ -233,16 +243,43 @@ fn admit_queue_with_retry(
                 sleep_ms(wait.wait_ms);
                 now_epoch_ms = current_epoch_ms();
             }
+            ChargeAttempt::Failed(error) => return Err(error),
         }
     }
 }
 
-fn refresh_and_attempt_charge(
+fn attempt_queue_charge(
+    predicted_wal_bytes: WalBytes,
+    policy: &EffectivePolicy,
+    now_epoch_ms: EpochMillis,
+    bucket: &mut BudgetBucketState,
+) -> ChargeAttempt {
+    let available_before = refresh_bucket(policy, now_epoch_ms, bucket);
+    try_charge(
+        policy.policy_id,
+        predicted_wal_bytes,
+        available_before,
+        bucket,
+    )
+}
+
+fn attempt_queue_charge_result(
     predicted_wal_bytes: WalBytes,
     policy: &EffectivePolicy,
     now_epoch_ms: EpochMillis,
     bucket: &mut BudgetBucketState,
 ) -> PwbResult<ChargeAttempt> {
+    match attempt_queue_charge(predicted_wal_bytes, policy, now_epoch_ms, bucket) {
+        ChargeAttempt::Failed(error) => Err(error),
+        attempt => Ok(attempt),
+    }
+}
+
+fn refresh_bucket(
+    policy: &EffectivePolicy,
+    now_epoch_ms: EpochMillis,
+    bucket: &mut BudgetBucketState,
+) -> WalBytes {
     refresh_bucket_policy(bucket, policy);
 
     let refilled = refill_available_bytes(
@@ -255,39 +292,44 @@ fn refresh_and_attempt_charge(
     bucket.available_bytes = refilled.available_bytes;
     bucket.last_refill_epoch_ms = refilled.last_refill_epoch_ms;
 
-    admit_charge_attempt(predicted_wal_bytes, policy, bucket.available_bytes, bucket)
+    bucket.available_bytes
 }
 
-fn admit_charge_attempt(
+fn try_charge(
+    policy_id: PolicyId,
     predicted_wal_bytes: WalBytes,
-    policy: &EffectivePolicy,
     available_before: WalBytes,
     bucket: &mut BudgetBucketState,
-) -> PwbResult<ChargeAttempt> {
+) -> ChargeAttempt {
     if !can_afford(available_before, predicted_wal_bytes) {
-        return Ok(ChargeAttempt::WouldWait(QueueWait {
-            policy_id: policy.policy_id,
+        let wait_ms = match wait_ms_for_deficit(
+            predicted_wal_bytes - available_before,
+            bucket.rate_bytes_per_sec,
+        ) {
+            Ok(wait_ms) => wait_ms,
+            Err(error) => return ChargeAttempt::Failed(error),
+        };
+
+        return ChargeAttempt::WouldWait(QueueWait {
+            policy_id,
             predicted_wal_bytes,
             available_wal_bytes: available_before,
-            wait_ms: wait_ms_for_deficit(
-                predicted_wal_bytes - available_before,
-                policy.wal_rate_bytes_per_sec,
-            )?,
-        }));
+            wait_ms,
+        });
     }
 
     bucket.available_bytes = charge_available(available_before, predicted_wal_bytes);
-    Ok(ChargeAttempt::Admitted(
+    ChargeAttempt::Admitted(
         AdmissionDecision::allowed(
-            Some(policy.policy_id),
+            Some(policy_id),
             predicted_wal_bytes,
             ReasonCode::BudgetAvailable,
         )
         .with_availability(available_before, bucket.available_bytes),
-    ))
+    )
 }
 
-const fn charge_attempt_to_reject_decision(attempt: ChargeAttempt) -> PwbResult<AdmissionDecision> {
+fn charge_attempt_to_reject_decision(attempt: ChargeAttempt) -> PwbResult<AdmissionDecision> {
     match attempt {
         ChargeAttempt::Admitted(decision) => Ok(decision),
         ChargeAttempt::WouldWait(wait) => Err(PwbError::BudgetExceeded {
@@ -295,6 +337,7 @@ const fn charge_attempt_to_reject_decision(attempt: ChargeAttempt) -> PwbResult<
             predicted_wal_bytes: wait.predicted_wal_bytes,
             available_wal_bytes: wait.available_wal_bytes,
         }),
+        ChargeAttempt::Failed(error) => Err(error),
     }
 }
 
@@ -471,8 +514,8 @@ mod tests {
     #[test]
     fn shadow_under_budget_allows_without_decrementing() {
         let mut bucket = bucket(3000);
-        let admission = admit_with_bucket(2000, &policy(BudgetMode::Shadow), 1000, &mut bucket)
-            .unwrap_or_else(|error| panic!("{error}"));
+        let admission =
+            admit_shadow_with_bucket(2000, &policy(BudgetMode::Shadow), 1000, &mut bucket);
 
         assert_eq!(
             admission,
@@ -485,8 +528,8 @@ mod tests {
     #[test]
     fn shadow_over_budget_would_reject_without_decrementing() {
         let mut bucket = bucket(1000);
-        let admission = admit_with_bucket(2000, &policy(BudgetMode::Shadow), 1000, &mut bucket)
-            .unwrap_or_else(|error| panic!("{error}"));
+        let admission =
+            admit_shadow_with_bucket(2000, &policy(BudgetMode::Shadow), 1000, &mut bucket);
 
         assert_eq!(
             admission,
@@ -498,8 +541,7 @@ mod tests {
     #[test]
     fn shadow_ephemeral_bucket_uses_full_burst_without_decrementing() {
         let admission =
-            admit_shadow_with_ephemeral_bucket(&context(6000), &policy(BudgetMode::Shadow), 1000)
-                .unwrap_or_else(|error| panic!("{error}"));
+            admit_shadow_with_ephemeral_bucket(&context(6000), &policy(BudgetMode::Shadow), 1000);
 
         assert_eq!(
             admission,
@@ -524,10 +566,24 @@ mod tests {
     }
 
     #[test]
+    fn refresh_bucket_returns_available_after_policy_and_refill_before_charge() {
+        let mut bucket = bucket(1000);
+        let mut policy = policy(BudgetMode::Reject);
+        policy.wal_rate_bytes_per_sec = 2000;
+
+        let available_before = refresh_bucket(&policy, 2000, &mut bucket);
+
+        assert_eq!(available_before, 3000);
+        assert_eq!(bucket.available_bytes, 3000);
+        assert_eq!(bucket.last_refill_epoch_ms, 2000);
+    }
+
+    #[test]
     fn reject_under_budget_charges_prediction() {
         let mut bucket = bucket(3000);
-        let admission = admit_with_bucket(2000, &policy(BudgetMode::Reject), 1000, &mut bucket)
-            .unwrap_or_else(|error| panic!("{error}"));
+        let admission =
+            admit_reject_with_bucket(2000, &policy(BudgetMode::Reject), 1000, &mut bucket)
+                .unwrap_or_else(|error| panic!("{error}"));
 
         assert_eq!(
             admission,
@@ -542,10 +598,11 @@ mod tests {
     #[test]
     fn reject_over_budget_returns_error_without_decrementing() {
         let mut bucket = bucket(1000);
-        let error = match admit_with_bucket(2000, &policy(BudgetMode::Reject), 1000, &mut bucket) {
-            Ok(admission) => panic!("expected budget exceeded, got {admission:?}"),
-            Err(error) => error,
-        };
+        let error =
+            match admit_reject_with_bucket(2000, &policy(BudgetMode::Reject), 1000, &mut bucket) {
+                Ok(admission) => panic!("expected budget exceeded, got {admission:?}"),
+                Err(error) => error,
+            };
 
         assert_eq!(
             error,
@@ -561,9 +618,7 @@ mod tests {
     #[test]
     fn queue_under_budget_charges_prediction() {
         let mut bucket = bucket(3000);
-        let attempt =
-            refresh_and_attempt_charge(2000, &policy(BudgetMode::Queue), 1000, &mut bucket)
-                .unwrap_or_else(|error| panic!("{error}"));
+        let attempt = attempt_queue_charge(2000, &policy(BudgetMode::Queue), 1000, &mut bucket);
 
         assert_eq!(
             attempt,
@@ -578,9 +633,7 @@ mod tests {
     #[test]
     fn queue_over_budget_reports_wait_without_decrementing() {
         let mut bucket = bucket(1000);
-        let attempt =
-            refresh_and_attempt_charge(2000, &policy(BudgetMode::Queue), 1000, &mut bucket)
-                .unwrap_or_else(|error| panic!("{error}"));
+        let attempt = attempt_queue_charge(2000, &policy(BudgetMode::Queue), 1000, &mut bucket);
 
         assert_eq!(
             attempt,
@@ -591,6 +644,66 @@ mod tests {
                 wait_ms: 1000,
             })
         );
+        assert_eq!(bucket.available_bytes, 1000);
+    }
+
+    #[test]
+    fn try_charge_admits_and_decrements_available() {
+        let mut bucket = bucket(3000);
+        let attempt = try_charge(POLICY_ID, 2000, 3000, &mut bucket);
+
+        assert_eq!(
+            attempt,
+            ChargeAttempt::Admitted(
+                AdmissionDecision::allowed(Some(POLICY_ID), 2000, ReasonCode::BudgetAvailable)
+                    .with_availability(3000, 1000)
+            )
+        );
+        assert_eq!(bucket.available_bytes, 1000);
+    }
+
+    #[test]
+    fn try_charge_reports_wait_without_decrementing() {
+        let mut bucket = bucket(1000);
+        let attempt = try_charge(POLICY_ID, 2000, 1000, &mut bucket);
+
+        assert_eq!(
+            attempt,
+            ChargeAttempt::WouldWait(QueueWait {
+                policy_id: POLICY_ID,
+                predicted_wal_bytes: 2000,
+                available_wal_bytes: 1000,
+                wait_ms: 1000,
+            })
+        );
+        assert_eq!(bucket.available_bytes, 1000);
+    }
+
+    #[test]
+    fn try_charge_reports_failed_on_zero_rate_deficit() {
+        let mut bucket = bucket(1000);
+        bucket.rate_bytes_per_sec = 0;
+        let attempt = try_charge(POLICY_ID, 2000, 1000, &mut bucket);
+
+        assert!(matches!(
+            attempt,
+            ChargeAttempt::Failed(PwbError::Internal { .. })
+        ));
+        assert_eq!(bucket.available_bytes, 1000);
+    }
+
+    #[test]
+    fn queue_charge_result_returns_error_for_failed_attempt() {
+        let mut bucket = bucket(1000);
+        let mut policy = policy(BudgetMode::Queue);
+        policy.wal_rate_bytes_per_sec = 0;
+
+        let error = match attempt_queue_charge_result(2000, &policy, 1000, &mut bucket) {
+            Ok(attempt) => panic!("expected error, got {attempt:?}"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, PwbError::Internal { .. }));
         assert_eq!(bucket.available_bytes, 1000);
     }
 
@@ -637,6 +750,25 @@ mod tests {
         assert_eq!(attempt_timestamps, vec![1000, 2000]);
         assert_eq!(sleep_calls, vec![1000]);
         assert_eq!(attempt_count, 2);
+    }
+
+    #[test]
+    fn queue_retry_returns_failed_attempt_error() {
+        let error = match admit_queue_with_retry(
+            1000,
+            |_| {
+                Ok(ChargeAttempt::Failed(PwbError::Internal {
+                    message: "queue policy has zero WAL refill rate".to_string(),
+                }))
+            },
+            |_| panic!("failed attempts should not sleep"),
+            || 2000,
+        ) {
+            Ok(admission) => panic!("expected error, got {admission:?}"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, PwbError::Internal { .. }));
     }
 
     #[test]
