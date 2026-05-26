@@ -17,6 +17,7 @@ static mut PREV_PROCESS_UTILITY_HOOK: pg_sys::ProcessUtility_hook_type = None;
 
 thread_local! {
     static ACTIVE_STATEMENTS: RefCell<Vec<ActiveStatementState>> = const { RefCell::new(Vec::new()) };
+    static EXECUTOR_ADMISSION_STACK: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
     static ADMISSION_BYPASS_DEPTH: RefCell<usize> = const { RefCell::new(0) };
 }
 
@@ -45,12 +46,15 @@ unsafe extern "C-unwind" fn executor_start_hook(
     query_desc: *mut pg_sys::QueryDesc,
     eflags: core::ffi::c_int,
 ) {
+    let mut admitted = false;
     if guc::enabled() && !admission_is_bypassed() {
         if let Some(active_statement) = handle_admission_result(admit_normal_statement(query_desc))
         {
             push_active_statement(reconcile::capture_start(active_statement));
+            admitted = true;
         }
     }
+    push_executor_admission_marker(admitted);
 
     // SAFETY: PostgreSQL invokes this hook with the same arguments expected by either the previous
     // hook or standard_ExecutorStart. This no-op hook only preserves hook chaining semantics.
@@ -75,7 +79,9 @@ unsafe extern "C-unwind" fn executor_end_hook(query_desc: *mut pg_sys::QueryDesc
         }
     }
 
-    if let Some(active_statement) = pop_active_statement() {
+    if pop_executor_admission_marker()
+        && let Some(active_statement) = pop_active_statement()
+    {
         reconcile::reconcile_completed_statement(&active_statement);
     }
 }
@@ -185,6 +191,10 @@ fn admit_normal_statement(
     // SAFETY: `query_desc` is the pointer PostgreSQL passed to ExecutorStart for this backend.
     let planned_statement = unsafe { planned_statement_ref(query_desc) }?;
     let statement_class = classify_planned_statement(planned_statement);
+    if matches!(statement_class, StatementClass::ReadOnly) {
+        return Ok(None);
+    }
+
     let query_id = extract_query_id(planned_statement);
     let scope = scope::classify_current_scope().map_err(AdmissionError::Internal)?;
     let predicted_wal_bytes = profile::predict_context(&profile::PredictionContext {
@@ -288,7 +298,20 @@ fn pop_active_statement() -> Option<ActiveStatementState> {
     ACTIVE_STATEMENTS.with(|statements| statements.borrow_mut().pop())
 }
 
+fn push_executor_admission_marker(admitted: bool) {
+    EXECUTOR_ADMISSION_STACK.with(|markers| {
+        markers.borrow_mut().push(admitted);
+    });
+}
+
+fn pop_executor_admission_marker() -> bool {
+    EXECUTOR_ADMISSION_STACK.with(|markers| markers.borrow_mut().pop().unwrap_or(false))
+}
+
 fn drain_active_statements() -> Vec<ActiveStatementState> {
+    EXECUTOR_ADMISSION_STACK.with(|markers| {
+        markers.borrow_mut().clear();
+    });
     ACTIVE_STATEMENTS.with(|statements| {
         let mut statements = statements.borrow_mut();
         let mut drained = Vec::with_capacity(statements.len());

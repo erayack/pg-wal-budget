@@ -485,18 +485,65 @@ mod tests {
         let mut state = test_state(0);
         let mut profiles = [];
 
-        assert!(
-            upsert_query_profile_locked(
-                &mut state,
-                &mut profiles,
-                Some(99),
-                42,
-                100,
-                1,
-                test_profile_weights(),
-            )
-            .is_err()
-        );
+        let error = match upsert_query_profile_locked(
+            &mut state,
+            &mut profiles,
+            Some(99),
+            42,
+            100,
+            1,
+            test_profile_weights(),
+        ) {
+            Ok(()) => panic!("expected capacity error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, profile_cache_capacity_exhausted());
+        assert_eq!(state.profiles_len, 0);
+    }
+
+    #[test]
+    fn rejects_batched_profile_upsert_when_capacity_is_zero() {
+        let mut state = test_state(0);
+        let mut profiles = [];
+
+        let error = match upsert_scoped_and_global_query_profiles_locked(
+            &mut state,
+            &mut profiles,
+            99,
+            42,
+            100,
+            1,
+            test_profile_weights(),
+        ) {
+            Ok(()) => panic!("expected capacity error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, profile_cache_capacity_exhausted());
+        assert_eq!(state.profiles_len, 0);
+    }
+
+    #[test]
+    fn rejects_restored_profile_when_capacity_is_zero() {
+        let mut state = test_state(0);
+        let mut profiles = [];
+
+        let error = match upsert_restored_query_profile_locked(
+            &mut state,
+            &mut profiles,
+            QueryProfileSnapshot {
+                scope_hash: Some(99),
+                query_id: 42,
+                profile: profile(100, 1),
+            },
+        ) {
+            Ok(()) => panic!("expected capacity error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, profile_cache_capacity_exhausted());
+        assert_eq!(state.profiles_len, 0);
     }
 
     #[test]

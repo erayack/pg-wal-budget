@@ -44,9 +44,19 @@ select pwb.reset_stats();
 
 select pwb.create_policy('role', current_user, 1, 1, 'queue', 100) as queue_policy_id;
 
+select count(*) as queue_bucket_count_before_impossible_statement
+from pwb.scope_stats()
+where policy_id = 1 \gset
+
 \set VERBOSITY sqlstate
 insert into pwb_queue_blocked_test (value) values ('blocked');
 \set VERBOSITY default
+
+select
+  count(*) = :queue_bucket_count_before_impossible_statement
+    as impossible_statement_did_not_allocate_queue_bucket
+from pwb.scope_stats()
+where policy_id = 1;
 
 select count(*) as inserted_rows from pwb_queue_blocked_test;
 

@@ -128,19 +128,6 @@ select
  t
 (1 row)
 
-select
-  exists (
-    select 1
-    from pwb.scope_stats()
-    where policy_id = 1
-      and available_bytes < max_burst_bytes
-      and debt_bytes = 0
-  ) as reject_bucket_charged;
- reject_bucket_charged 
------------------------
- t
-(1 row)
-
 select pwb.set_policy_mode(1, 'observe');
  set_policy_mode 
 -----------------
@@ -190,16 +177,13 @@ from pwb.counters();
 (1 row)
 
 select
-  exists (
+  not exists (
     select 1
     from pwb.recent_decisions(20)
-    where policy_id = 1
-      and decision_kind = 'allowed'
-      and statement_class = 'read_only'
-      and predicted_wal_bytes = 0
-  ) as read_only_allowed_recorded;
- read_only_allowed_recorded 
-----------------------------
+    where statement_class = 'read_only'
+  ) as read_only_bypassed_admission;
+ read_only_bypassed_admission 
+------------------------------
  t
 (1 row)
 

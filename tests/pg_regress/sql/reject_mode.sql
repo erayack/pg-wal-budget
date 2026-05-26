@@ -68,15 +68,6 @@ select
       and available_before - available_after = predicted_wal_bytes
   ) as reject_allowed_recorded;
 
-select
-  exists (
-    select 1
-    from pwb.scope_stats()
-    where policy_id = 1
-      and available_bytes < max_burst_bytes
-      and debt_bytes = 0
-  ) as reject_bucket_charged;
-
 select pwb.set_policy_mode(1, 'observe');
 
 truncate table pwb.policy restart identity cascade;
@@ -97,13 +88,10 @@ select
 from pwb.counters();
 
 select
-  exists (
+  not exists (
     select 1
     from pwb.recent_decisions(20)
-    where policy_id = 1
-      and decision_kind = 'allowed'
-      and statement_class = 'read_only'
-      and predicted_wal_bytes = 0
-  ) as read_only_allowed_recorded;
+    where statement_class = 'read_only'
+  ) as read_only_bypassed_admission;
 
 select pwb.set_policy_mode(1, 'observe');

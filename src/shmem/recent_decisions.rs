@@ -37,30 +37,42 @@ pub(super) fn record_recent_decision_locked(
 
 pub(crate) fn snapshot_recent_decisions(limit: usize) -> PwbResult<Vec<RecentDecisionRecord>> {
     with_locked_state(|state, recent_decisions, _profiles| {
-        let capacity = recent_decision_capacity(state);
-        if capacity == 0 || limit == 0 {
-            return Ok(Vec::new());
-        }
-
-        let count = recent_decision_count(state);
-        let snapshot_count = limit.min(count).min(capacity);
-        let mut records = Vec::with_capacity(snapshot_count);
-        let mut sequence =
-            state
-                .recent_decision_head
-                .checked_sub(1)
-                .ok_or_else(|| PwbError::Internal {
-                    message: "recent decision ring head underflow".to_string(),
-                })?;
-
-        for _ in 0..snapshot_count {
-            let slot = ring_slot(sequence, capacity);
-            records.push(recent_decisions[slot].decode()?);
-            sequence = sequence.saturating_sub(1);
-        }
-
-        Ok(records)
+        snapshot_recent_decisions_from_slice(state, recent_decisions, limit)
     })
+}
+
+fn snapshot_recent_decisions_from_slice(
+    state: &PwbSharedState,
+    recent_decisions: &[PwbRecentDecision],
+    limit: usize,
+) -> PwbResult<Vec<RecentDecisionRecord>> {
+    let capacity = recent_decision_capacity(state);
+    if capacity == 0 || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let count = recent_decision_count(state);
+    let snapshot_count = limit.min(count).min(capacity);
+    if snapshot_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut records = Vec::with_capacity(snapshot_count);
+    let mut sequence =
+        state
+            .recent_decision_head
+            .checked_sub(1)
+            .ok_or_else(|| PwbError::Internal {
+                message: "recent decision ring head underflow".to_string(),
+            })?;
+
+    for _ in 0..snapshot_count {
+        let slot = ring_slot(sequence, capacity);
+        records.push(recent_decisions[slot].decode()?);
+        sequence = sequence.saturating_sub(1);
+    }
+
+    Ok(records)
 }
 
 #[allow(
@@ -92,5 +104,19 @@ mod tests {
         assert_eq!(ring_slot(3, 4), 3);
         assert_eq!(ring_slot(4, 4), 0);
         assert_eq!(ring_slot(9, 4), 1);
+    }
+
+    #[test]
+    fn snapshots_empty_ring_without_underflow() {
+        let state = PwbSharedState {
+            recent_decision_capacity: 4,
+            ..crate::shmem::records::test_state(0)
+        };
+        let recent_decisions = [PwbRecentDecision::default(); 4];
+
+        let snapshot = snapshot_recent_decisions_from_slice(&state, &recent_decisions, 20)
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(snapshot.is_empty());
     }
 }

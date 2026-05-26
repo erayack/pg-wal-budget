@@ -174,6 +174,75 @@ mod tests {
     }
 
     #[test]
+    fn new_budget_bucket_errors_without_capacity() {
+        let mut state = test_state(0);
+        let mut buckets = [];
+
+        let error = match apply_budget_bucket(
+            &mut state,
+            &mut buckets,
+            7,
+            99,
+            || BudgetBucketState {
+                policy_id: 7,
+                scope_hash: 99,
+                available_bytes: 1024,
+                max_burst_bytes: 4096,
+                rate_bytes_per_sec: 512,
+                last_refill_epoch_ms: 123,
+                debt_bytes: 0,
+            },
+            |_bucket| Ok(()),
+        ) {
+            Ok(()) => panic!("expected capacity error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, budget_bucket_capacity_exhausted());
+        assert_eq!(state.budget_buckets_len, 0);
+    }
+
+    #[test]
+    fn new_budget_bucket_errors_when_capacity_is_full() {
+        let mut state = test_state(1);
+        state.budget_buckets_len = 1;
+        let initial = BudgetBucketState {
+            policy_id: 7,
+            scope_hash: 99,
+            available_bytes: 1024,
+            max_burst_bytes: 4096,
+            rate_bytes_per_sec: 512,
+            last_refill_epoch_ms: 123,
+            debt_bytes: 0,
+        };
+        let mut buckets = [PwbBudgetBucket::encode(initial)];
+
+        let error = match apply_budget_bucket(
+            &mut state,
+            &mut buckets,
+            7,
+            100,
+            || BudgetBucketState {
+                policy_id: 7,
+                scope_hash: 100,
+                available_bytes: 1024,
+                max_burst_bytes: 4096,
+                rate_bytes_per_sec: 512,
+                last_refill_epoch_ms: 123,
+                debt_bytes: 0,
+            },
+            |_bucket| Ok(()),
+        ) {
+            Ok(()) => panic!("expected capacity error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, budget_bucket_capacity_exhausted());
+        assert_eq!(state.budget_buckets_len, 1);
+        assert_eq!(buckets[0], PwbBudgetBucket::encode(initial));
+    }
+
+    #[test]
     fn existing_budget_bucket_is_persisted_when_callback_succeeds() {
         let mut state = test_state(1);
         state.budget_buckets_len = 1;
