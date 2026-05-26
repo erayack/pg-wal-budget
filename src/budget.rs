@@ -199,11 +199,11 @@ fn admit_queue_statement(
     now_epoch_ms: EpochMillis,
 ) -> PwbResult<AdmissionDecision> {
     if context.predicted_wal_bytes > policy.wal_burst_bytes {
-        return Err(PwbError::BudgetExceeded {
-            policy_id: policy.policy_id,
-            predicted_wal_bytes: context.predicted_wal_bytes,
-            available_wal_bytes: policy.wal_burst_bytes,
-        });
+        return Err(budget_exceeded_error(
+            policy.policy_id,
+            context.predicted_wal_bytes,
+            policy.wal_burst_bytes,
+        ));
     }
 
     admit_queue_with_retry(
@@ -332,12 +332,24 @@ fn try_charge(
 fn charge_attempt_to_reject_decision(attempt: ChargeAttempt) -> PwbResult<AdmissionDecision> {
     match attempt {
         ChargeAttempt::Admitted(decision) => Ok(decision),
-        ChargeAttempt::WouldWait(wait) => Err(PwbError::BudgetExceeded {
-            policy_id: wait.policy_id,
-            predicted_wal_bytes: wait.predicted_wal_bytes,
-            available_wal_bytes: wait.available_wal_bytes,
-        }),
+        ChargeAttempt::WouldWait(wait) => Err(budget_exceeded_error(
+            wait.policy_id,
+            wait.predicted_wal_bytes,
+            wait.available_wal_bytes,
+        )),
         ChargeAttempt::Failed(error) => Err(error),
+    }
+}
+
+const fn budget_exceeded_error(
+    policy_id: PolicyId,
+    predicted_wal_bytes: WalBytes,
+    available_wal_bytes: WalBytes,
+) -> PwbError {
+    PwbError::BudgetExceeded {
+        policy_id,
+        predicted_wal_bytes,
+        available_wal_bytes,
     }
 }
 
@@ -508,6 +520,18 @@ mod tests {
         assert_eq!(
             admission,
             AdmissionDecision::allowed(Some(POLICY_ID), 0, ReasonCode::PolicyDisabled)
+        );
+    }
+
+    #[test]
+    fn budget_exceeded_error_preserves_payload() {
+        assert_eq!(
+            budget_exceeded_error(POLICY_ID, 2000, 1000),
+            PwbError::BudgetExceeded {
+                policy_id: POLICY_ID,
+                predicted_wal_bytes: 2000,
+                available_wal_bytes: 1000,
+            }
         );
     }
 

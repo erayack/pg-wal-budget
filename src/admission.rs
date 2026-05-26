@@ -115,14 +115,10 @@ pub(crate) fn admit_context(
             predicted_wal_bytes,
             available_wal_bytes,
         }) => {
-            let decision = AdmissionDecision::rejected(policy_id, predicted_wal_bytes)
-                .with_availability(available_wal_bytes, available_wal_bytes);
+            let (decision, error) =
+                budget_exceeded_rejection(policy_id, predicted_wal_bytes, available_wal_bytes);
             record_admission_decision(context, decision, now_epoch_ms);
-            Err(AdmissionError::Rejected {
-                policy_id,
-                predicted_wal_bytes,
-                available_wal_bytes,
-            })
+            Err(error)
         }
         Err(error) => Err(AdmissionError::internal_with_context(
             error,
@@ -167,6 +163,22 @@ const fn active_statement_from_context(
         statement_class: context.statement_class,
         predicted_wal_bytes: context.predicted_wal_bytes,
     }
+}
+
+const fn budget_exceeded_rejection(
+    policy_id: PolicyId,
+    predicted_wal_bytes: WalBytes,
+    available_wal_bytes: WalBytes,
+) -> (AdmissionDecision, AdmissionError) {
+    (
+        AdmissionDecision::rejected(policy_id, predicted_wal_bytes)
+            .with_availability(available_wal_bytes, available_wal_bytes),
+        AdmissionError::Rejected {
+            policy_id,
+            predicted_wal_bytes,
+            available_wal_bytes,
+        },
+    )
 }
 
 fn counter_delta_for_decision(
@@ -260,7 +272,32 @@ fn internal_fail_open_recent_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ScopeKey;
+    use crate::types::{ReasonCode, ScopeKey};
+
+    #[test]
+    fn budget_exceeded_rejection_uses_same_payload_for_decision_and_error() {
+        let (decision, error) = budget_exceeded_rejection(7, 2000, 1000);
+
+        assert_eq!(
+            decision,
+            AdmissionDecision::rejected(7, 2000).with_availability(1000, 1000)
+        );
+        assert_eq!(decision.kind, DecisionKind::Rejected);
+        assert_eq!(decision.policy_id, Some(7));
+        assert_eq!(decision.charged_bytes, 2000);
+        assert_eq!(decision.available_before, 1000);
+        assert_eq!(decision.available_after, 1000);
+        assert_eq!(decision.reason_code, ReasonCode::BudgetExceeded);
+
+        assert!(matches!(
+            error,
+            AdmissionError::Rejected {
+                policy_id: 7,
+                predicted_wal_bytes: 2000,
+                available_wal_bytes: 1000,
+            }
+        ));
+    }
 
     #[test]
     fn fail_open_recent_decision_preserves_sentinel_context_when_none_available() {
