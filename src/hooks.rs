@@ -2,7 +2,7 @@ use std::cell::RefCell;
 
 use pgrx::pg_sys;
 
-use crate::admission::{self, AdmissionError};
+use crate::admission::{self, AdmissionError, AdmissionErrorContext};
 use crate::errors::{self, PwbError};
 use crate::guc;
 use crate::profile;
@@ -196,7 +196,12 @@ fn admit_normal_statement(
     }
 
     let query_id = extract_query_id(planned_statement);
-    let scope = scope::classify_current_scope().map_err(AdmissionError::Internal)?;
+    let scope = scope::classify_current_scope().map_err(|error| {
+        AdmissionError::internal_with_context(
+            error,
+            AdmissionErrorContext::from_statement(query_id, statement_class),
+        )
+    })?;
     let predicted_wal_bytes = profile::predict_context(&profile::PredictionContext {
         statement_class,
         query_id,
@@ -230,8 +235,8 @@ fn handle_admission_result(
             predicted_wal_bytes,
             available_wal_bytes,
         }),
-        Err(AdmissionError::Internal(error)) => {
-            handle_internal_admission_error(error);
+        Err(AdmissionError::Internal { error, context }) => {
+            handle_internal_admission_error(error, context);
             None
         }
     }
@@ -241,7 +246,7 @@ unsafe fn planned_statement_ref<'a>(
     query_desc: *mut pg_sys::QueryDesc,
 ) -> Result<&'a pg_sys::PlannedStmt, AdmissionError> {
     if query_desc.is_null() {
-        return Err(AdmissionError::Internal(PwbError::Internal {
+        return Err(AdmissionError::internal(PwbError::Internal {
             message: "executor start received a null QueryDesc".to_string(),
         }));
     }
@@ -249,7 +254,7 @@ unsafe fn planned_statement_ref<'a>(
     // SAFETY: The caller passes PostgreSQL's QueryDesc pointer for the current executor hook.
     let planned_statement = unsafe { (*query_desc).plannedstmt };
     if planned_statement.is_null() {
-        return Err(AdmissionError::Internal(PwbError::Internal {
+        return Err(AdmissionError::internal(PwbError::Internal {
             message: "executor start received a QueryDesc without a PlannedStmt".to_string(),
         }));
     }
@@ -279,9 +284,9 @@ const fn extract_query_id(planned_statement: &pg_sys::PlannedStmt) -> Option<Que
     }
 }
 
-fn handle_internal_admission_error(error: PwbError) {
+fn handle_internal_admission_error(error: PwbError, context: Option<AdmissionErrorContext>) {
     if guc::fail_open() {
-        admission::record_internal_fail_open();
+        admission::record_internal_fail_open(context);
         return;
     }
 

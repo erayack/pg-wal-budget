@@ -2,7 +2,7 @@ use std::ffi::CStr;
 
 use pgrx::pg_sys;
 
-use crate::admission::{self, AdmissionError};
+use crate::admission::{self, AdmissionError, AdmissionErrorContext};
 use crate::errors::{PwbError, PwbResult};
 use crate::profile;
 use crate::scope;
@@ -14,13 +14,18 @@ pub(crate) fn admit_utility_statement(
 ) -> Result<Option<ActiveStatementState>, AdmissionError> {
     // SAFETY: `pstmt` is the PlannedStmt pointer PostgreSQL passed to ProcessUtility.
     let planned_statement =
-        unsafe { planned_statement_ref(pstmt) }.map_err(AdmissionError::Internal)?;
+        unsafe { planned_statement_ref(pstmt) }.map_err(AdmissionError::internal)?;
     let statement_class = classify_utility_statement(planned_statement, read_only_tree);
     if matches!(statement_class, StatementClass::ReadOnly) {
         return Ok(None);
     }
     let query_id = extract_utility_query_id(planned_statement);
-    let scope = scope::classify_current_scope().map_err(AdmissionError::Internal)?;
+    let scope = scope::classify_current_scope().map_err(|error| {
+        AdmissionError::internal_with_context(
+            error,
+            AdmissionErrorContext::from_statement(query_id, statement_class),
+        )
+    })?;
     let predicted_wal_bytes = profile::predict_context(&profile::PredictionContext {
         statement_class,
         query_id,
