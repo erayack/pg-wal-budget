@@ -97,8 +97,9 @@ pub(crate) fn admit_context(
 ) -> Result<ActiveStatementState, AdmissionError> {
     let now_epoch_ms = time::current_epoch_ms();
 
-    let Some(effective_policy) = policy::effective_policy_for_scope(&context.scope)
-        .map_err(|error| AdmissionError::internal_from_admission_context(error, context))?
+    let Some(effective_policy) =
+        policy::effective_policy_for_scope(&context.scope, now_epoch_ms)
+            .map_err(|error| AdmissionError::internal_from_admission_context(error, context))?
     else {
         let decision = AdmissionDecision::no_matching_policy();
         record_admission_decision(context, decision, now_epoch_ms);

@@ -185,12 +185,21 @@ fn admit_reject_with_bucket(
     bucket: &mut BudgetBucketState,
 ) -> PwbResult<AdmissionDecision> {
     let available_before = refresh_bucket(policy, now_epoch_ms, bucket);
-    charge_attempt_to_reject_decision(try_charge(
-        policy.policy_id,
+    if !can_afford(available_before, predicted_wal_bytes) {
+        return Err(budget_exceeded_error(
+            policy.policy_id,
+            predicted_wal_bytes,
+            available_before,
+        ));
+    }
+
+    bucket.available_bytes = charge_available(available_before, predicted_wal_bytes);
+    Ok(AdmissionDecision::allowed(
+        Some(policy.policy_id),
         predicted_wal_bytes,
-        available_before,
-        bucket,
-    ))
+        ReasonCode::BudgetAvailable,
+    )
+    .with_availability(available_before, bucket.available_bytes))
 }
 
 fn admit_queue_statement(
@@ -327,18 +336,6 @@ fn try_charge(
         )
         .with_availability(available_before, bucket.available_bytes),
     )
-}
-
-fn charge_attempt_to_reject_decision(attempt: ChargeAttempt) -> PwbResult<AdmissionDecision> {
-    match attempt {
-        ChargeAttempt::Admitted(decision) => Ok(decision),
-        ChargeAttempt::WouldWait(wait) => Err(budget_exceeded_error(
-            wait.policy_id,
-            wait.predicted_wal_bytes,
-            wait.available_wal_bytes,
-        )),
-        ChargeAttempt::Failed(error) => Err(error),
-    }
 }
 
 const fn budget_exceeded_error(

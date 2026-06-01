@@ -9,7 +9,6 @@ use crate::budget::EffectivePolicy;
 use crate::errors::{self, PwbError, PwbResult};
 use crate::hooks;
 use crate::privileges::{self, PrivilegeGate};
-use crate::time;
 use crate::types::{BudgetMode, EpochMillis, PolicyId, ScopeKey, ScopeKind, WalBytes};
 
 const POLICY_CACHE_REFRESH_INTERVAL_MS: EpochMillis = 1000;
@@ -75,9 +74,10 @@ pub(crate) fn validate_policy_mode(mode: &str) -> PwbResult<BudgetMode> {
     BudgetMode::parse_sql(mode)
 }
 
-pub(crate) fn effective_policy_for_scope(scope: &ScopeKey) -> PwbResult<Option<EffectivePolicy>> {
-    let now_epoch_ms = time::current_epoch_ms();
-
+pub(crate) fn effective_policy_for_scope(
+    scope: &ScopeKey,
+    now_epoch_ms: EpochMillis,
+) -> PwbResult<Option<EffectivePolicy>> {
     let should_reload = POLICY_CACHE.with(|cache| {
         cache
             .borrow()
@@ -190,19 +190,23 @@ fn required_policy_field<T>(field: &'static str, value: spi::SpiResult<Option<T>
 }
 
 fn find_effective_policy(cache: &PolicyCache, scope: &ScopeKey) -> Option<EffectivePolicy> {
-    cache
-        .policies
-        .iter()
-        .find(|policy| policy_matches_scope(policy, scope))
-        .map(|policy| policy.policy)
+    for policy in &cache.policies {
+        if policy_matches_scope(policy, scope) {
+            return Some(policy.policy);
+        }
+    }
+    None
 }
 
 fn policy_matches_scope(policy: &CachedEffectivePolicy, scope: &ScopeKey) -> bool {
-    policy.scope_kind == scope.kind
-        && policy
-            .scope_value
-            .as_deref()
-            .is_none_or(|policy_scope| Some(policy_scope) == scope.debug_value.as_deref())
+    if policy.scope_kind != scope.kind {
+        return false;
+    }
+
+    match policy.scope_value.as_deref() {
+        None => true,
+        Some(policy_scope) => Some(policy_scope) == scope.debug_value.as_deref(),
+    }
 }
 
 const fn cache_is_stale(cache: &PolicyCache, now_epoch_ms: EpochMillis) -> bool {
