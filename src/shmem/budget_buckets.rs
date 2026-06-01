@@ -26,8 +26,10 @@ pub(crate) fn with_existing_budget_bucket<R>(
     scope_hash: ScopeHash,
     callback: impl FnOnce(&mut BudgetBucketState) -> PwbResult<R>,
 ) -> PwbResult<Option<R>> {
-    with_locked_bucket_state(|_state, buckets| {
-        let Some(slot) = find_budget_bucket_slot(buckets, policy_id, scope_hash) else {
+    with_locked_bucket_state(|state, buckets| {
+        let occupied_len = occupied_budget_bucket_len(state, buckets);
+        let Some(slot) = find_budget_bucket_slot(&buckets[..occupied_len], policy_id, scope_hash)
+        else {
             return Ok(None);
         };
 
@@ -46,9 +48,8 @@ fn apply_budget_bucket<R>(
     initializer: impl FnOnce() -> BudgetBucketState,
     callback: impl FnOnce(&mut BudgetBucketState) -> PwbResult<R>,
 ) -> PwbResult<R> {
-    let mut first_empty_slot = None;
-
-    for (slot, bucket) in buckets.iter().enumerate() {
+    let occupied_len = occupied_budget_bucket_len(state, buckets);
+    for (slot, bucket) in buckets[..occupied_len].iter().enumerate() {
         if bucket.occupied == 1 && bucket.policy_id == policy_id && bucket.scope_hash == scope_hash
         {
             let mut bucket = bucket.state();
@@ -56,24 +57,31 @@ fn apply_budget_bucket<R>(
             buckets[slot] = PwbBudgetBucket::encode(bucket);
             return Ok(result);
         }
-
-        if bucket.occupied == 0 && first_empty_slot.is_none() {
-            first_empty_slot = Some(slot);
-        }
     }
 
-    let Some(slot) = first_empty_slot else {
+    if occupied_len == buckets.len() {
         return Err(budget_bucket_capacity_exhausted());
-    };
+    }
 
+    let slot = occupied_len;
     let mut bucket = initializer();
     let result = callback(&mut bucket)?;
     buckets[slot] = PwbBudgetBucket::encode(bucket);
-    state.budget_buckets_len = state
-        .budget_buckets_len
-        .saturating_add(1)
-        .min(state.budget_bucket_capacity);
+    state.budget_buckets_len += 1;
     Ok(result)
+}
+
+fn occupied_budget_bucket_len(state: &PwbSharedState, buckets: &[PwbBudgetBucket]) -> usize {
+    debug_assert!(
+        state.budget_buckets_len <= state.budget_bucket_capacity,
+        "budget bucket occupied length exceeded configured capacity"
+    );
+    debug_assert_eq!(
+        state.budget_bucket_capacity as usize,
+        buckets.len(),
+        "budget bucket slice length must match configured capacity"
+    );
+    state.budget_buckets_len as usize
 }
 
 fn snapshot_budget_buckets_from_slice(
@@ -82,7 +90,10 @@ fn snapshot_budget_buckets_from_slice(
 ) -> PwbResult<Vec<BudgetBucketSnapshot>> {
     let mut snapshots = Vec::with_capacity(occupied_len.min(buckets.len()));
 
-    for bucket in buckets.iter().filter(|bucket| bucket.occupied == 1) {
+    for bucket in buckets[..occupied_len.min(buckets.len())]
+        .iter()
+        .filter(|bucket| bucket.occupied == 1)
+    {
         let decoded = bucket.decode()?;
         snapshots.push(BudgetBucketSnapshot {
             policy_id: decoded.policy_id,
@@ -278,5 +289,44 @@ mod tests {
                 .available_bytes,
             256
         );
+    }
+
+    #[test]
+    fn new_budget_bucket_appends_after_occupied_prefix() {
+        let mut state = test_state(2);
+        state.budget_buckets_len = 1;
+        let initial = BudgetBucketState {
+            policy_id: 7,
+            scope_hash: 99,
+            available_bytes: 1024,
+            max_burst_bytes: 4096,
+            rate_bytes_per_sec: 512,
+            last_refill_epoch_ms: 123,
+            debt_bytes: 0,
+        };
+        let appended = BudgetBucketState {
+            policy_id: 8,
+            scope_hash: 100,
+            available_bytes: 2048,
+            max_burst_bytes: 8192,
+            rate_bytes_per_sec: 1024,
+            last_refill_epoch_ms: 456,
+            debt_bytes: 0,
+        };
+        let mut buckets = [PwbBudgetBucket::encode(initial), PwbBudgetBucket::default()];
+
+        apply_budget_bucket(
+            &mut state,
+            &mut buckets,
+            appended.policy_id,
+            appended.scope_hash,
+            || appended,
+            |_bucket| Ok(()),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(state.budget_buckets_len, 2);
+        assert_eq!(buckets[0], PwbBudgetBucket::encode(initial));
+        assert_eq!(buckets[1], PwbBudgetBucket::encode(appended));
     }
 }

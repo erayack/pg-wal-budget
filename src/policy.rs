@@ -203,10 +203,10 @@ fn policy_matches_scope(policy: &CachedEffectivePolicy, scope: &ScopeKey) -> boo
         return false;
     }
 
-    match policy.scope_value.as_deref() {
-        None => true,
-        Some(policy_scope) => Some(policy_scope) == scope.debug_value.as_deref(),
-    }
+    policy
+        .scope_value
+        .as_deref()
+        .is_none_or(|policy_scope| Some(policy_scope) == scope.debug_value.as_deref())
 }
 
 const fn cache_is_stale(cache: &PolicyCache, now_epoch_ms: EpochMillis) -> bool {
