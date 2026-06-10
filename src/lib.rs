@@ -7,6 +7,7 @@ pub(crate) mod budget;
 pub(crate) mod errors;
 pub(crate) mod guc;
 pub(crate) mod hooks;
+pub(crate) mod lifecycle;
 pub(crate) mod policy;
 pub(crate) mod privileges;
 pub(crate) mod profile;
