@@ -135,16 +135,14 @@ pub(crate) fn record_internal_fail_open(context: Option<AdmissionErrorContext>) 
     let predicted_wal_bytes = context
         .and_then(|context| context.predicted_wal_bytes)
         .unwrap_or(0);
-    let _ = shmem::add_counters(counter_delta_for_decision(decision, predicted_wal_bytes));
-    let _ = shmem::record_recent_decision(internal_fail_open_recent_decision(
-        context,
-        decision,
-        now_epoch_ms,
-    ));
+    let _ = shmem::record_decision_telemetry(
+        counter_delta_for_decision(decision, predicted_wal_bytes),
+        internal_fail_open_recent_decision(context, decision, now_epoch_ms),
+    );
 }
 
 pub(crate) fn record_missing_actual_wal() {
-    let _ = shmem::add_counters(CounterDelta {
+    let _ = shmem::add_counter_delta(CounterDelta {
         missing_actual_wal_count: 1,
         ..CounterDelta::default()
     });

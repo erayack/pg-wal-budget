@@ -57,7 +57,7 @@ pub(crate) fn admit_statement(
 
     match policy.mode {
         BudgetMode::Shadow => admit_shadow_statement(context, policy, now_epoch_ms),
-        BudgetMode::Reject => shmem::with_budget_bucket(
+        BudgetMode::Reject => shmem::admit_with_budget_bucket(
             policy.policy_id,
             context.scope.value_hash,
             || initial_bucket_state(policy, context.scope.value_hash, now_epoch_ms),
@@ -75,12 +75,7 @@ pub(crate) fn refund_charged_bytes(
     scope_hash: ScopeHash,
     bytes: WalBytes,
 ) -> PwbResult<()> {
-    shmem::with_existing_budget_bucket(policy_id, scope_hash, |bucket| {
-        bucket.available_bytes =
-            refund_available(bucket.available_bytes, bucket.max_burst_bytes, bytes);
-        Ok(())
-    })?;
-    Ok(())
+    shmem::refund_budget_charge(policy_id, scope_hash, bytes)
 }
 
 pub(crate) fn record_underprediction_debt(
@@ -88,11 +83,7 @@ pub(crate) fn record_underprediction_debt(
     scope_hash: ScopeHash,
     bytes: WalBytes,
 ) -> PwbResult<()> {
-    shmem::with_existing_budget_bucket(policy_id, scope_hash, |bucket| {
-        bucket.debt_bytes = bucket.debt_bytes.saturating_add(bytes);
-        Ok(())
-    })?;
-    Ok(())
+    shmem::record_budget_debt(policy_id, scope_hash, bytes)
 }
 
 const fn initial_bucket_state(
@@ -218,7 +209,7 @@ fn admit_queue_statement(
     admit_queue_with_retry(
         now_epoch_ms,
         |now_epoch_ms| {
-            shmem::with_budget_bucket(
+            shmem::admit_with_budget_bucket(
                 policy.policy_id,
                 context.scope.value_hash,
                 || initial_bucket_state(policy, context.scope.value_hash, now_epoch_ms),
@@ -395,6 +386,7 @@ const fn charge_available(available: WalBytes, predicted: WalBytes) -> WalBytes 
     available - predicted
 }
 
+#[cfg(test)]
 fn refund_available(available: WalBytes, max_burst: WalBytes, refund: WalBytes) -> WalBytes {
     available.saturating_add(refund).min(max_burst)
 }

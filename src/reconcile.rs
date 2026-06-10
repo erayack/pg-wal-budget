@@ -77,30 +77,31 @@ pub(crate) fn reconcile_completed_statement(statement: &ActiveStatementState) {
         0
     };
 
-    record_reconciliation_result(&shmem::add_counters(CounterDelta {
-        actual_wal_bytes,
-        absolute_prediction_error: prediction_error(
-            statement.predicted_wal_bytes,
+    record_reconciliation_result(&shmem::record_decision_telemetry(
+        CounterDelta {
             actual_wal_bytes,
-        ),
-        scope_debt_bytes: debt_bytes,
-        ..CounterDelta::default()
-    }));
-
-    record_reconciliation_result(&shmem::record_recent_decision(RecentDecisionRecord {
-        timestamp_epoch_ms: now_epoch_ms,
-        decision_kind: statement.decision.kind,
-        policy_id: statement.decision.policy_id,
-        scope_kind: statement.scope_kind,
-        scope_hash: statement.scope_hash,
-        query_id: statement.query_id,
-        statement_class: statement.statement_class,
-        predicted_wal_bytes: statement.predicted_wal_bytes,
-        actual_wal_bytes: Some(actual_wal_bytes),
-        available_before: statement.decision.available_before,
-        available_after: statement.decision.available_after,
-        reason_code: statement.decision.reason_code,
-    }));
+            absolute_prediction_error: prediction_error(
+                statement.predicted_wal_bytes,
+                actual_wal_bytes,
+            ),
+            scope_debt_bytes: debt_bytes,
+            ..CounterDelta::default()
+        },
+        RecentDecisionRecord {
+            timestamp_epoch_ms: now_epoch_ms,
+            decision_kind: statement.decision.kind,
+            policy_id: statement.decision.policy_id,
+            scope_kind: statement.scope_kind,
+            scope_hash: statement.scope_hash,
+            query_id: statement.query_id,
+            statement_class: statement.statement_class,
+            predicted_wal_bytes: statement.predicted_wal_bytes,
+            actual_wal_bytes: Some(actual_wal_bytes),
+            available_before: statement.decision.available_before,
+            available_after: statement.decision.available_after,
+            reason_code: statement.decision.reason_code,
+        },
+    ));
 
     if let Some(query_id) = charge.query_id {
         record_reconciliation_result(&profile::record_query_observation(
@@ -124,7 +125,7 @@ pub(crate) fn record_aborted_statement(statement: &ActiveStatementState) -> PwbR
 
     let result = (|| {
         budget::refund_charged_bytes(policy_id, charge.scope_hash, charge.charged_bytes)?;
-        shmem::add_counters(CounterDelta {
+        shmem::add_counter_delta(CounterDelta {
             aborted_after_charge_count: 1,
             ..CounterDelta::default()
         })
@@ -197,7 +198,7 @@ const fn current_backend_wal_bytes() -> Option<WalBytes> {
 
 fn record_reconciliation_result(result: &PwbResult<()>) {
     if result.is_err() {
-        let _ = shmem::add_counters(CounterDelta {
+        let _ = shmem::add_counter_delta(CounterDelta {
             internal_fail_open_count: 1,
             ..CounterDelta::default()
         });

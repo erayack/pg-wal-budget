@@ -14,24 +14,24 @@ mod profiles;
 mod recent_decisions;
 mod records;
 mod scope_names;
+mod transactions;
 
-pub(crate) use budget_buckets::{
-    snapshot_budget_buckets, with_budget_bucket, with_existing_budget_bucket,
-};
-pub(crate) use counters::{add_counters, snapshot_counters};
 use layout::{SharedCapacities, SharedLayout, capacity_to_u32, compute_layout};
 pub(crate) use profiles::{
-    ensure_profiles_loaded, lookup_scoped_or_global_query_profile, persist_profiles_if_due,
-    persist_profiles_now, reset_profiles, snapshot_query_profiles,
-    upsert_scoped_and_global_query_profiles,
+    lookup_scoped_or_global_query_profile, reset_profiles, upsert_scoped_and_global_query_profiles,
 };
-pub(crate) use recent_decisions::{record_recent_decision, snapshot_recent_decisions};
 pub(crate) use records::{
     BudgetBucketSnapshot, BudgetBucketState, CounterDelta, PwbCounters, QueryProfileSnapshot,
     RecentDecisionRecord, ScopeNameSnapshot,
 };
 use records::{PwbBudgetBucket, PwbProfileEntry, PwbRecentDecision, PwbScopeName, PwbSharedState};
-pub(crate) use scope_names::snapshot_scope_names;
+pub(crate) use transactions::{
+    add_counter_delta, admit_with_budget_bucket, budget_bucket_snapshots, counters_snapshot,
+    ensure_profiles_loaded, persist_profiles_if_due, persist_profiles_now, query_profile_snapshots,
+    recent_decision_snapshots, record_admission_telemetry, record_budget_debt,
+    record_decision_telemetry, refund_budget_charge, scope_name_snapshots,
+    with_existing_budget_bucket,
+};
 
 const SHMEM_NAME: &[u8] = b"pg_wal_budget shared state\0";
 const LWLOCK_TRANCHE_NAME: &[u8] = b"pg_wal_budget\0";
@@ -106,7 +106,7 @@ pub(crate) fn reset_stats() -> PwbResult<()> {
     })
 }
 
-pub(crate) fn record_admission_telemetry(
+fn record_admission_telemetry_locked(
     delta: CounterDelta,
     recent_decision: RecentDecisionRecord,
     scope: &ScopeKey,

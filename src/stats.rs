@@ -89,7 +89,7 @@ fn pwb_counters() -> TableIterator<
         name!(scope_name_drop_count, i64),
     ),
 > {
-    let counters = shmem::snapshot_counters().unwrap_or_else(errors::raise);
+    let counters = shmem::counters_snapshot().unwrap_or_else(errors::raise);
     TableIterator::new(vec![counters_row(counters)])
 }
 
@@ -107,7 +107,7 @@ fn pwb_scope_stats() -> TableIterator<
         name!(last_refill_epoch_ms, i64),
     ),
 > {
-    let buckets = shmem::snapshot_budget_buckets().unwrap_or_else(errors::raise);
+    let buckets = shmem::budget_bucket_snapshots().unwrap_or_else(errors::raise);
     TableIterator::new(buckets.into_iter().map(scope_stats_row))
 }
 
@@ -125,7 +125,7 @@ fn pwb_query_profiles() -> TableIterator<
         name!(is_global, bool),
     ),
 > {
-    let profiles = shmem::snapshot_query_profiles().unwrap_or_else(errors::raise);
+    let profiles = shmem::query_profile_snapshots().unwrap_or_else(errors::raise);
     TableIterator::new(profiles.into_iter().map(query_profile_row))
 }
 
@@ -151,7 +151,7 @@ fn pwb_recent_decisions(
     ),
 > {
     let limit = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
-    let decisions = shmem::snapshot_recent_decisions(limit).unwrap_or_else(errors::raise);
+    let decisions = shmem::recent_decision_snapshots(limit).unwrap_or_else(errors::raise);
     TableIterator::new(decisions.into_iter().map(recent_decision_row))
 }
 
@@ -168,7 +168,7 @@ fn pwb_scope_names() -> TableIterator<
         name!(seen_count, i64),
     ),
 > {
-    let scope_names = shmem::snapshot_scope_names().unwrap_or_else(errors::raise);
+    let scope_names = shmem::scope_name_snapshots().unwrap_or_else(errors::raise);
     TableIterator::new(scope_names.into_iter().map(scope_name_row))
 }
 
