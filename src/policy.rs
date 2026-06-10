@@ -6,6 +6,7 @@ use pgrx::prelude::*;
 use pgrx::spi;
 
 use crate::budget::EffectivePolicy;
+use crate::catalog::{DurableCatalogStore, DurablePolicyRow, SpiCatalogStore};
 use crate::errors::{self, PwbError, PwbResult};
 use crate::hooks;
 use crate::privileges::{self, PrivilegeGate};
@@ -107,69 +108,14 @@ pub(crate) fn invalidate_backend_policy_cache() {
 }
 
 fn load_policy_cache(now_epoch_ms: EpochMillis) -> PwbResult<PolicyCache> {
-    if !policy_table_exists()? {
-        return Ok(PolicyCache {
-            refreshed_epoch_ms: now_epoch_ms,
-            policies: Vec::new(),
-        });
-    }
+    load_policy_cache_from(&SpiCatalogStore, now_epoch_ms)
+}
 
-    let policies = Spi::connect(|client| -> PwbResult<Vec<CachedEffectivePolicy>> {
-        let table = client
-            .select(
-                "
-                select
-                  policy_id,
-                  scope_kind,
-                  scope_value,
-                  enabled,
-                  mode,
-                  wal_rate_bytes_per_sec,
-                  wal_burst_bytes
-                from pwb.policy
-                where enabled = true
-                order by priority desc, policy_id asc
-                ",
-                None,
-                &[],
-            )
-            .map_err(spi_error)?;
-
-        let mut policies = Vec::with_capacity(table.len());
-        for row in table {
-            let policy_id =
-                required_policy_field("policy_id", row.get_by_name::<PolicyId, _>("policy_id"))?;
-            let scope_kind =
-                required_policy_field("scope_kind", row.get_by_name::<String, _>("scope_kind"))?;
-            let scope_value = row
-                .get_by_name::<String, _>("scope_value")
-                .map_err(spi_error)?;
-            let enabled = required_policy_field("enabled", row.get_by_name::<bool, _>("enabled"))?;
-            let mode = required_policy_field("mode", row.get_by_name::<String, _>("mode"))?;
-            let wal_rate_bytes_per_sec = required_policy_field(
-                "wal_rate_bytes_per_sec",
-                row.get_by_name::<i64, _>("wal_rate_bytes_per_sec"),
-            )?;
-            let wal_burst_bytes = required_policy_field(
-                "wal_burst_bytes",
-                row.get_by_name::<i64, _>("wal_burst_bytes"),
-            )?;
-            let budget = validate_policy_budget_update(wal_rate_bytes_per_sec, wal_burst_bytes)?;
-
-            policies.push(CachedEffectivePolicy {
-                scope_kind: ScopeKind::parse_sql(&scope_kind)?,
-                scope_value: normalize_scope_value(scope_value.as_deref()),
-                policy: EffectivePolicy {
-                    policy_id,
-                    enabled,
-                    mode: BudgetMode::parse_sql(&mode)?,
-                    wal_rate_bytes_per_sec: budget.wal_rate_bytes_per_sec,
-                    wal_burst_bytes: budget.wal_burst_bytes,
-                },
-            });
-        }
-        Ok(policies)
-    })?;
+fn load_policy_cache_from(
+    store: &impl DurableCatalogStore,
+    now_epoch_ms: EpochMillis,
+) -> PwbResult<PolicyCache> {
+    let policies = load_policy_rows(store.load_enabled_policy_rows()?)?;
 
     Ok(PolicyCache {
         refreshed_epoch_ms: now_epoch_ms,
@@ -177,16 +123,24 @@ fn load_policy_cache(now_epoch_ms: EpochMillis) -> PwbResult<PolicyCache> {
     })
 }
 
-fn policy_table_exists() -> PwbResult<bool> {
-    Spi::get_one::<bool>("select to_regclass('pwb.policy') is not null")
-        .map(|exists| exists.unwrap_or(false))
-        .map_err(spi_error)
-}
-
-fn required_policy_field<T>(field: &'static str, value: spi::SpiResult<Option<T>>) -> PwbResult<T> {
-    value.map_err(spi_error)?.ok_or_else(|| PwbError::Internal {
-        message: format!("effective policy row is missing {field}"),
-    })
+fn load_policy_rows(rows: Vec<DurablePolicyRow>) -> PwbResult<Vec<CachedEffectivePolicy>> {
+    rows.into_iter()
+        .map(|row| {
+            let budget =
+                validate_policy_budget_update(row.wal_rate_bytes_per_sec, row.wal_burst_bytes)?;
+            Ok(CachedEffectivePolicy {
+                scope_kind: ScopeKind::parse_sql(&row.scope_kind)?,
+                scope_value: normalize_scope_value(row.scope_value.as_deref()),
+                policy: EffectivePolicy {
+                    policy_id: row.policy_id,
+                    enabled: row.enabled,
+                    mode: BudgetMode::parse_sql(&row.mode)?,
+                    wal_rate_bytes_per_sec: budget.wal_rate_bytes_per_sec,
+                    wal_burst_bytes: budget.wal_burst_bytes,
+                },
+            })
+        })
+        .collect()
 }
 
 fn find_effective_policy(cache: &PolicyCache, scope: &ScopeKey) -> Option<EffectivePolicy> {
@@ -592,6 +546,30 @@ mod tests {
             find_effective_policy(&cache, &scope).map(|policy| policy.policy_id),
             Some(POLICY_ID)
         );
+    }
+
+    #[test]
+    fn builds_policy_cache_entries_from_memory_store() {
+        let store = crate::catalog::MemoryCatalogStore::with_rows(
+            vec![DurablePolicyRow {
+                policy_id: POLICY_ID,
+                scope_kind: "tenant".to_string(),
+                scope_value: Some(" tenant-a ".to_string()),
+                enabled: true,
+                mode: "reject".to_string(),
+                wal_rate_bytes_per_sec: 100,
+                wal_burst_bytes: 500,
+            }],
+            Vec::new(),
+        );
+        let cache = load_policy_cache_from(&store, 1000).unwrap_or_else(|error| panic!("{error}"));
+        let scope = ScopeKey::with_debug_value(ScopeKind::Tenant, SCOPE_HASH, "tenant-a");
+
+        let policy =
+            find_effective_policy(&cache, &scope).unwrap_or_else(|| panic!("policy should match"));
+        assert_eq!(policy.policy_id, POLICY_ID);
+        assert_eq!(policy.mode, BudgetMode::Reject);
+        assert_eq!(policy.wal_burst_bytes, 500);
     }
 
     #[test]

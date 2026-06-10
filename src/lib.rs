@@ -4,6 +4,7 @@ use pgrx::{pg_sys, prelude::*};
 
 pub(crate) mod admission;
 pub(crate) mod budget;
+pub(crate) mod catalog;
 pub(crate) mod errors;
 pub(crate) mod guc;
 pub(crate) mod hooks;
