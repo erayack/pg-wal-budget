@@ -116,11 +116,10 @@ To fully unload hooks and shared memory, remove `pg_wal_budget` from `shared_pre
 
 ## Upgrade Notes
 
-Version `0.2.1` updates the durable `pwb.policy` mode constraint so upgraded `0.2.0`
-installations can store `queue` policies. Upgrade with:
+Version `0.3.0` includes admission lifecycle, policy cache, catalog-store, and shared-memory refactors. It has no durable SQL schema changes from `0.2.1`. Upgrade with:
 
 ```sql
-alter extension pg_wal_budget update to '0.2.1';
+alter extension pg_wal_budget update to '0.3.0';
 ```
 
 Before rolling back to older code or older extension SQL, change all `queue` policies to a legacy

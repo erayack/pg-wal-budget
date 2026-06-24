@@ -1,5 +1,5 @@
 comment = 'Observe and enforce PostgreSQL WAL-generation budgets by scope'
-default_version = '0.2.1'
+default_version = '0.3.0'
 module_pathname = '$libdir/pg_wal_budget'
 relocatable = false
 schema = 'pwb'
